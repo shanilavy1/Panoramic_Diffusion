@@ -1,0 +1,4 @@
+name: XRAY_CTPA
+root_dir: "/media/rotem/7045cbc8-3ee4-485f-a6ea-18f7520d2704/Shani/Carotid_Plaque_data/CT_PX_dataset_diffusion"
+image_channels: 1
+augmentation: True
