@@ -39,7 +39,6 @@ import cv2
 from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import PatchDiscriminator
 from params import *
-from ddpm.classifier import latent_network
 from ddpm.lora import inject_trainable_lora
 
 # Function to convert a color image tensor to grayscale using PIL
@@ -728,12 +727,10 @@ class GaussianDiffusion(nn.Module):
             url = "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/blob/main/vae-ft-mse-840000-ema-pruned.safetensors"  # can also be a local file
             self.vae = AutoencoderKL.from_single_file(url).cuda()
             self.vae.eval()
-        if img_cond:
-            if self.medclip:
-                model, preprocess = create_model_from_pretrained(('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'))
-                self.xray_encoder = model
-            else:
-                self.xray_encoder = CLIPVisionModel.from_pretrained('openai/clip-vit-large-patch14')
+
+        # CT conditioning is handled directly by UNet's CT3Dto2DProjector
+        # No need for xray_encoder since we're doing CT->Xray diffusion
+        self.img_cond = img_cond
 
         betas = cosine_beta_schedule(timesteps)
         alphas = 1. - betas
@@ -781,9 +778,6 @@ class GaussianDiffusion(nn.Module):
         # text conditioning parameters
         self.text_use_bert_cls = text_use_bert_cls
 
-        # image conditioning parameters
-        self.img_cond = img_cond
-
         # dynamic thresholding when sampling
         self.use_dynamic_thres = use_dynamic_thres
         self.dynamic_thres_percentile = dynamic_thres_percentile
@@ -798,23 +792,6 @@ class GaussianDiffusion(nn.Module):
         self.perceptual_model = PerceptualLoss(spatial_dims=2, network_type="radimagenet_resnet50")
         self.perceptual_model.cuda()
 
-        # For class label conditionaing
-        self.text_encoder = CLIPTextModel.from_pretrained('openai/clip-vit-large-patch14')
-        self.tokenizer = CLIPTokenizer.from_pretrained('openai/clip-vit-large-patch14')
-
-        #Load classification model
-        self.classifier = latent_network.LatentNetwork(
-            num_classes=1,
-            num_channels = 4,
-            sample_size=32,
-            sample_duration=64)
-
-        self.classifier = self.classifier.cuda()
-        classifier_path = "./pretrained_models/classification_model_256.pth.tar"
-        pretrained = torch.load(classifier_path, weights_only=False)
-
-        self.classifier.load_state_dict(pretrained, strict=False)
-        self.pos_weight = torch.cuda.FloatTensor([POS_WEIGHT]).cuda()
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -839,9 +816,10 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
-        x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond_ct=None, cond_scale=1.):
+        # For 2D X-ray diffusion with CT conditioning, pass cond_ct directly to denoise_fn
+        noise_pred = self.denoise_fn(x, t, cond_ct=cond_ct)
+        x_recon = self.predict_start_from_noise(x, t=t, noise=noise_pred)
 
         if clip_denoised:
             s = 1.
@@ -863,10 +841,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond_ct=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond_ct=cond_ct, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -874,7 +852,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.):
+    def p_sample_loop(self, shape, cond_ct=None, cond_scale=1.):
         device = self.betas.device
 
         b = shape[0]
@@ -882,69 +860,40 @@ class GaussianDiffusion(nn.Module):
 
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), cond_ct=cond_ct, cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
-    def sample(self, cond=None, cond_scale=1., batch_size=16):
+    def sample(self, cond_ct=None, cond_scale=1., batch_size=16):
+        """
+        Sample 2D X-ray images conditioned on CT.
+
+        Args:
+            cond_ct: VAE-encoded CT tensor of shape [B, 4, 128, 32, 32]
+            cond_scale: conditioning scale (not used in current implementation)
+            batch_size: batch size for sampling
+
+        Returns:
+            Generated X-ray images of shape [B, 1, 224, 224]
+        """
         device = next(self.denoise_fn.parameters()).device
 
-        if is_list_str(cond):
-            cond = bert_embed(tokenize(cond)).to(device)
-        elif self.img_cond:
-            if self.medclip:
-                cond = self.xray_encoder.encode_image(cond.to(device), normalize=True)
-                cond = cond.to(device)
-            else:
-                cond = self.xray_encoder(cond.to(device))[0]
+        # CT is already VAE-encoded, just move to device
+        if cond_ct is not None:
+            cond_ct = cond_ct.to(device)
+            batch_size = cond_ct.shape[0]
 
-            if self.cfg:
-                # when sampling the label is unknown class = 2
-                batch_size = cond.shape[0] if exists(cond) else batch_size
-                label = torch.full((batch_size, 1), 2).cuda()
-                cond = torch.cat((cond, label), dim=-1).cuda()
-
-        batch_size = cond.shape[0] if exists(cond) else batch_size
         image_size = self.image_size
         channels = self.channels
-        num_frames = self.num_frames
+
+        # Sample 2D X-ray: shape is (batch_size, channels, height, width)
         _sample = self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale)
+            (batch_size, channels, image_size, image_size), cond_ct=cond_ct, cond_scale=cond_scale)
 
-        if isinstance(self.vqgan, VQGAN):
-            # denormalize TODO: Remove eventually
-            _sample = (((_sample + 1.0) / 2.0) * (self.vqgan.codebook.embeddings.max() -
-                                                  self.vqgan.codebook.embeddings.min())) + self.vqgan.codebook.embeddings.min()
+        # Unnormalize the output (from [-1, 1] to [0, 1])
+        _sample = unnormalize_img(_sample)
 
-            _sample = self.vqgan.decode(_sample, quantize=True)
-
-        elif isinstance(self.vae, AutoencoderKL):
-            slices = []
-            gray_slice = []
-            _sample = (((_sample + 1.0) / 2.0) * (self.max_val - self.min_val)) + self.min_val
-            _sample = 1 / 0.18215 * _sample
-
-            for i in range(_sample.shape[2]):
-                with torch.no_grad():
-                    slice = self.vae.decode(_sample[:,:,i,:,:], return_dict=False)[0]
-
-                slice = (slice / 2 + 0.5).clamp(0, 1)
-                slice = slice.cpu().permute(0, 2, 3, 1).numpy()
-                slice = (slice * 255).round().astype("uint8")
-                slice = list(
-                        map(lambda _: Image.fromarray(_[:, :, 0]), slice)
-                        if slice.shape[3] == 1
-                        else map(lambda _: cv2.cvtColor(_, cv2.COLOR_BGR2GRAY), slice)
-                        )
-                gray_slice = torch.from_numpy(np.stack(slice, axis=0))
-                slices.append(gray_slice.unsqueeze(1))
-
-            _sample = torch.cat(slices, dim=1).cuda()
-            _sample = _sample.unsqueeze(1)
-
-        else:
-            unnormalize_img(_sample)
         return _sample
 
     @torch.inference_mode()
@@ -973,31 +922,29 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod,
                     t, x_start.shape) * noise
         )
-    def lpips_loss_fn(self, x_start,x_recon):
+    def lpips_loss_fn(self, x_start, x_recon):
+        """
+        Perceptual loss for 2D X-ray images.
 
-        B, C, T, H, W = x_recon.shape
+        Args:
+            x_start: Original X-ray images [B, C, H, W]
+            x_recon: Reconstructed X-ray images [B, C, H, W]
 
-        # Selects one random 2D image from each 3D Image
-        frame_idx = torch.randint(0, T, [B]).cuda()
-        frame_idx_selected = frame_idx.reshape(-1,
-                                           1, 1, 1, 1).repeat(1, C, 1, H, W)
-        frames = torch.gather(x_start, 2, frame_idx_selected).squeeze(2)
-        frames_recon = torch.gather(x_recon, 2, frame_idx_selected).squeeze(2)
+        Returns:
+            Perceptual loss value
+        """
+        # Unnormalize from [-1, 1] to [0, 1] for perceptual loss
+        x_start_unnorm = (x_start + 1.0) / 2.0
+        x_recon_unnorm = (x_recon + 1.0) / 2.0
 
-        # Decode the selected frame and reconstructed frame
-        frames = (((frames + 1.0) / 2.0) * (self.max_val - self.min_val)) + self.min_val
-        frames_recon = (((frames_recon + 1.0) / 2.0) * (self.max_val - self.min_val)) + self.min_val
-
-        frames = 1 / 0.18215 * frames
-        frames_recon = 1 / 0.18215 * frames_recon
-
-        with torch.no_grad():
-            frames_decoded = self.vae.decode(frames, return_dict=False)[0] if self.vae else frames
-            frames_recon_decoded = self.vae.decode(frames_recon, return_dict=False)[0] if self.vae else frames_recon               
+        # Convert grayscale to 3-channel for perceptual model if needed
+        if x_start_unnorm.shape[1] == 1:
+            x_start_unnorm = x_start_unnorm.repeat(1, 3, 1, 1)
+            x_recon_unnorm = x_recon_unnorm.repeat(1, 3, 1, 1)
 
         # perceptual loss
         lpips_loss = self.perceptual_model(
-            frames_recon_decoded.float(), frames_decoded.float()).mean() * self.perceptual_weight
+            x_recon_unnorm.float(), x_start_unnorm.float()).mean() * self.perceptual_weight
         return lpips_loss
 
     def disc_loss_fn(self, x_real,x_fake):
@@ -1016,56 +963,21 @@ class GaussianDiffusion(nn.Module):
 
         return loss_d
 
-    def p_losses(self, x_start, t, cond=None, label=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond_ct=None, noise=None, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        # Add noise to X-ray
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        if is_list_str(cond):
-            cond = bert_embed(
-                tokenize(cond), return_cls_repr=self.text_use_bert_cls)
-            cond = cond.to(device)
-        elif self.img_cond:
-            if self.medclip:
-                cond = self.xray_encoder.encode_image(cond.to(device), normalize=True)
-                cond = cond.to(device)
-            else:
-                cond = self.xray_encoder(cond.to(device))[0]
 
-        if self.cfg:
-            random_n = torch.rand(1)
-
-            text_label = False
-            if random_n[0] > 0.5:
-                #Class label conditioning
-                text = label
-                if text_label:
-                    token = self.tokenizer(text, padding=True, return_tensors="pt")
-                    label = self.text_encoder(**token.to(device))[0]
-            else:
-                #No Class label conditioning
-                if text_label:
-                    text = ["Unknown", "Unknown"]
-                    token = self.tokenizer(text, padding=True, return_tensors="pt")
-                    label = self.text_encoder(**token.to(device))[0]
-                else:
-                    label = label.new_full(label.size(), 2)
-
-            cond = torch.cat((cond, label), dim=-1)
-
-        pred_noise = self.denoise_fn(x_noisy, t, cond=cond, **kwargs)
+        # Predict noise using UNet with CT conditioning
+        pred_noise = self.denoise_fn(x_noisy, t, cond_ct=cond_ct, **kwargs)
         x_recon = self.predict_start_from_noise(x_noisy, t=t, noise=pred_noise)
 
-        # Classification loss
-        cls_loss = 0
-        if self.classification_weight > 0:
-            output, _ = self.classifier(x_recon)
-            cls_loss = F.binary_cross_entropy_with_logits(output, label, pos_weight=self.pos_weight)
-            cls_loss = cls_loss * self.classification_weight
         # Perceptual loss
         lpips_loss = 0
         if self.perceptual_weight > 0:
-            lpips_loss = self.lpips_loss_fn(x_start,x_recon)
+            lpips_loss = self.lpips_loss_fn(x_start, x_recon)
 
         # Discriminator loss
         disc_loss = 0
@@ -1076,50 +988,42 @@ class GaussianDiffusion(nn.Module):
             loss = F.l1_loss(noise, pred_noise)
         elif self.loss_type == 'l2':
             loss = F.mse_loss(noise, pred_noise)
-        elif self.loss_type =='l1_cls':
-            loss = F.l1_loss(noise, pred_noise)*self.l1_weight + cls_loss
         elif self.loss_type == 'l1_lpips':
             loss = F.l1_loss(noise, pred_noise)*self.l1_weight + lpips_loss
         elif self.loss_type == 'l1_disc':
             loss = F.l1_loss(noise, pred_noise)*self.l1_weight + disc_loss
         elif self.loss_type == 'l1_lpips_disc':
             loss = F.l1_loss(noise, pred_noise)*self.l1_weight + lpips_loss + disc_loss
-        elif self.loss_type == 'l1_cls_lpips_disc':
-            loss = F.l1_loss(noise, pred_noise)*self.l1_weight + lpips_loss + disc_loss + cls_loss
         else:
             raise NotImplementedError()
 
         return loss
 
     def forward(self, x, *args, **kwargs):
-        ct = x['ct'].cuda()
-        xray = x['cxr'].cuda()
-        label = x['target'].cuda()
-        if isinstance(self.vqgan, VQGAN):
-            with torch.no_grad():
-                ct = self.vqgan.encode(
-                    ct, quantize=False, include_embeddings=True)
-                # normalize to -1 and 1
-                ct = ((ct - self.vqgan.codebook.embeddings.min()) /
-                     (self.vqgan.codebook.embeddings.max() -
-                      self.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+        """
+        Forward pass for training: diffuse X-ray conditioned on CT.
 
-        elif isinstance(self.vae, AutoencoderKL):
-            # normalize to -1 and 1
-            ct[ct < self.min_val] = self.min_val
-            ct[ct > self.max_val] = self.max_val
-            ct = ((ct - self.min_val) / (self.max_val - self.min_val)) * 2.0 - 1.0
-            self.vae.to(ct.device)
-            self.vae.eval()
-        else:
-            print("Hi")
-            ct = normalize_img(ct)
+        Args:
+            x: Dictionary containing 'ct' and 'cxr' tensors
+                - ct: VAE-encoded CT [B, 4, 128, 32, 32]
+                - cxr: X-ray images [B, 1, 224, 224]
 
-        b, device, img_size, = ct.shape[0], ct.device, self.image_size
-        check_shape(ct, 'b c f h w', c=self.channels,
-                    f=self.num_frames, h=img_size, w=img_size)
+        Returns:
+            Diffusion loss
+        """
+        ct = x['ct'].cuda()      # CT is the condition [B, 4, 128, 32, 32]
+        xray = x['cxr'].cuda()   # X-ray is the diffusion target [B, 1, 224, 224]
+
+        # Normalize X-ray to [-1, 1] for diffusion
+        xray = normalize_img(xray)
+
+        b, device, img_size = xray.shape[0], xray.device, self.image_size
+
+        # Sample random timesteps
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(ct, t, cond=xray, label=label, *args, **kwargs)
+
+        # Apply diffusion on X-ray with CT as condition
+        return self.p_losses(xray, t, cond_ct=ct, *args, **kwargs)
 
 # trainer class
 CHANNELS_TO_MODE = {
@@ -1399,38 +1303,32 @@ class Trainer(object):
                     num_samples = self.num_sample_rows ** 2
                     batches = num_to_groups(num_samples, self.batch_size)
 
+                    # Get CT condition from validation data
                     sampled_data = next(self.val_dl)
-                    xrays = sampled_data['cxr']
-                    all_videos_list = list(
-                        map(lambda n: self.ema_model.sample(cond=xrays, batch_size=n), batches))
-                    all_videos_list = torch.cat(all_videos_list, dim=0)
+                    ct_cond = sampled_data['ct'].cuda()  # CT is now the condition
 
-                all_videos_list = F.pad(all_videos_list, (2, 2, 2, 2))
+                    # Sample X-rays conditioned on CT
+                    all_xrays_list = list(
+                        map(lambda n: self.ema_model.sample(cond_ct=ct_cond[:n], batch_size=n), batches))
+                    all_xrays_list = torch.cat(all_xrays_list, dim=0)
 
-                one_gif = rearrange(
-                    all_videos_list, '(i j) c f h w -> c f (i h) (j w)', i=self.num_sample_rows)
-                video_path = str(self.results_folder / str(f'{milestone}.gif'))
-                video_tensor_to_gif(one_gif, video_path)
-                log = {**log, 'sample': video_path}
+                # Pad for visualization
+                all_xrays_list = F.pad(all_xrays_list, (2, 2, 2, 2))
 
-                # Selects one random 2D image from each 3D Image
-                B, C, D, H, W = all_videos_list.shape
-                frame_idx = torch.randint(0, D, [B]).cuda()
-                frame_idx_selected = frame_idx.reshape(
-                    -1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
-                frames = torch.gather(
-                    all_videos_list, 2, frame_idx_selected).squeeze(2)
-
-                path = str(self.results_folder /
-                           f'sample-{milestone}.jpg')
+                # Save sampled X-rays as a grid image
+                path = str(self.results_folder / f'sample-{milestone}.jpg')
                 plt.figure(figsize=(50, 50))
                 cols = 5
-                for num, frame in enumerate(frames.cpu()):
+                B, C, H, W = all_xrays_list.shape
+                for num, xray in enumerate(all_xrays_list.cpu()):
                     plt.subplot(
-                        math.ceil(len(frames) / cols), cols, num + 1)
+                        math.ceil(B / cols), cols, num + 1)
                     plt.axis('off')
-                    plt.imshow(frame[0], cmap='gray')
-                    plt.savefig(path)
+                    plt.imshow(xray[0], cmap='gray')
+                plt.savefig(path)
+                plt.close()
+
+                log = {**log, 'sample': path}
 
                 self.save(milestone)
 
