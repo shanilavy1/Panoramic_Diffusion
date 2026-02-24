@@ -744,8 +744,15 @@ class GaussianDiffusion(nn.Module):
         self.use_dynamic_thres = use_dynamic_thres
         self.dynamic_thres_percentile = dynamic_thres_percentile
 
-        # discriminator
-        self.netD = PatchDiscriminator(spatial_dims=3, num_layers_d=4, num_channels=32, in_channels=4, out_channels=1, kernel_size= 3)
+        # discriminator for 2D X-ray images (adapted from 3D to 2D)
+        self.netD = PatchDiscriminator(
+            spatial_dims=2,      # Changed from 3 to 2 for 2D X-rays
+            num_layers_d=4,
+            num_channels=32,
+            in_channels=1,       # Changed from 4 to 1 for grayscale X-ray
+            out_channels=1,
+            kernel_size=3
+        )
         self.netD.cuda()
         self.adv_loss = PatchAdversarialLoss(criterion="least_squares")
         self.optimizerD = Adam(params=self.netD.parameters(), lr=1e-4)
