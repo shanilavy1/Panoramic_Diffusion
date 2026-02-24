@@ -25,23 +25,15 @@ def run(cfg: DictConfig):
     # Create diffusion model for 2D X-ray generation conditioned on CT
     diffusion = GaussianDiffusion(
         model,
-        vqgan_ckpt=cfg.model.vqgan_ckpt,
-        vae_ckpt=cfg.model.vae_ckpt,
-        image_size=cfg.model.diffusion_img_size, # 224
-        num_frames=cfg.model.diffusion_depth_size,
-        channels=cfg.model.diffusion_num_channels, # 1
+        image_size=cfg.model.diffusion_img_size,  # 224
+        num_frames=cfg.model.diffusion_depth_size,  # kept for compatibility
+        channels=cfg.model.diffusion_num_channels,  # 1
         timesteps=cfg.model.timesteps,
-        img_cond=True,
         loss_type=cfg.model.loss_type,
         l1_weight=cfg.model.l1_weight,
         perceptual_weight=cfg.model.perceptual_weight,
         discriminator_weight=cfg.model.discriminator_weight,
-        classification_weight=cfg.model.classification_weight,
-        classifier_free_guidance=cfg.model.classifier_free_guidance,
-        medclip=cfg.model.medclip,
-        name_dataset=cfg.model.name_dataset,
-        dataset_min_value=cfg.model.dataset_min_value,
-        dataset_max_value=cfg.model.dataset_max_value,
+        name_dataset=cfg.model.name_dataset
     ).cuda()
 
     # Get datasets
@@ -65,7 +57,7 @@ def run(cfg: DictConfig):
         num_workers=cfg.model.num_workers,
         max_grad_norm=cfg.model.max_grad_norm,
         lora = cfg.model.lora,
-        lora_first = cfg.model.lora_first,
+        lora_first = cfg.model.lora_first
     )
 
     # Load checkpoint if specified

@@ -10,29 +10,22 @@ from functools import partial
 from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
-import torch.optim as optim
-from torchvision import transforms as T, utils
+from torchvision import transforms as T
 from torch.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
 from einops import rearrange
-from einops_exts import check_shape, rearrange_many
+from einops_exts import rearrange_many
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from ddpm.text import tokenize, bert_embed, BERT_MODEL_DIM
-from transformers import CLIPVisionModel, CLIPTextModel, CLIPTokenizer
-from open_clip import create_model_from_pretrained
+from ddpm.text import BERT_MODEL_DIM
 
 from torch.utils.data import Dataset, DataLoader
-from vq_gan_3d.model.vqgan import VQGAN
 from diffusers import AutoencoderKL
 
 import matplotlib.pyplot as plt
-#import wandb
-import SimpleITK as sitk
-from PIL import Image
 import numpy as np
 import cv2
 # MONAI Generative 3D models
@@ -681,60 +674,29 @@ class GaussianDiffusion(nn.Module):
         image_size,
         num_frames,
         text_use_bert_cls=False,
-        img_cond = False,
         channels=3,
         timesteps=1000,
         loss_type='l1',
         use_dynamic_thres=False,  # from the Imagen paper
         dynamic_thres_percentile=0.9,
-        vqgan_ckpt=None,
-        vae_ckpt=None,
-        medclip = True,
         l1_weight = 1.0,
         perceptual_weight = 1.0,
         discriminator_weight = 0.0,
-        classification_weight = 1.0,
-        classifier_free_guidance = False,
-        name_dataset = 'RSPECT',
-        dataset_min_value = -5.1874175,
-        dataset_max_value = 5.1038833,
+        name_dataset = 'XRAY_CTPA',
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
-        self.vqgan_ckpt = vqgan_ckpt
-        self.vae_ckpt = str(vae_ckpt)
-        self.ddim_sampling_eta = 0
-        self.vae = None
-        self.vqgan = None
-        self.name_dataset = name_dataset
-        self.medclip = medclip
         self.perceptual_weight = perceptual_weight
+        self.name_dataset = name_dataset
         self.l1_weight = l1_weight
         self.discriminator_weight = discriminator_weight
-        self.classification_weight = classification_weight
-        self.cfg = classifier_free_guidance
-        self.max_val = dataset_max_value
-        self.min_val = dataset_min_value
-
-        if vqgan_ckpt is not None:
-            self.vqgan = VQGAN.load_from_checkpoint(vqgan_ckpt).cuda()
-            self.vqgan.eval()
-
-        if vae_ckpt is not None:
-            url = "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/blob/main/vae-ft-mse-840000-ema-pruned.safetensors"  # can also be a local file
-            self.vae = AutoencoderKL.from_single_file(url).cuda()
-            self.vae.eval()
-
-        # CT conditioning is handled directly by UNet's CT3Dto2DProjector
-        # No need for xray_encoder since we're doing CT->Xray diffusion
-        self.img_cond = img_cond
 
         betas = cosine_beta_schedule(timesteps)
         alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
 
         timesteps, = betas.shape
@@ -786,9 +748,9 @@ class GaussianDiffusion(nn.Module):
         self.netD = PatchDiscriminator(spatial_dims=3, num_layers_d=4, num_channels=32, in_channels=4, out_channels=1, kernel_size= 3)
         self.netD.cuda()
         self.adv_loss = PatchAdversarialLoss(criterion="least_squares")
-        self.optimizerD = optim.Adam(params=self.netD.parameters(), lr=1e-4)
+        self.optimizerD = Adam(params=self.netD.parameters(), lr=1e-4)
 
-        # perceptual loss
+        # perceptual loss for 2D images
         self.perceptual_model = PerceptualLoss(spatial_dims=2, network_type="radimagenet_resnet50")
         self.perceptual_model.cuda()
 
@@ -963,8 +925,22 @@ class GaussianDiffusion(nn.Module):
 
         return loss_d
 
+
     def p_losses(self, x_start, t, cond_ct=None, noise=None, **kwargs):
-        b, c, f, h, w, device = *x_start.shape, x_start.device
+        """
+        Compute diffusion loss for 2D X-ray generation conditioned on CT.
+
+        Args:
+            x_start: Target X-ray images [B, C, H, W]
+            t: Timestep indices [B]
+            cond_ct: VAE-encoded CT condition [B, 4, 128, 32, 32]
+            noise: Optional noise tensor
+
+        Returns:
+            Diffusion loss
+        """
+        b, c, h, w = x_start.shape
+        device = x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # Add noise to X-ray
