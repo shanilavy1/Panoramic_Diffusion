@@ -28,11 +28,19 @@ from diffusers import AutoencoderKL
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
-# MONAI Generative 3D models
+# MONAI Generative models
 from generative.losses import PatchAdversarialLoss, PerceptualLoss
 from generative.networks.nets import PatchDiscriminator
 from params import *
 from ddpm.lora import inject_trainable_lora
+
+# Wandb for experiment tracking
+import wandb
+
+# Metrics for validation
+from skimage.metrics import structural_similarity as ssim_metric
+from skimage.metrics import peak_signal_noise_ratio as psnr_metric
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 # Function to convert a color image tensor to grayscale using PIL
 def to_grayscale(tensor):
@@ -1109,6 +1117,16 @@ class Dataset(data.Dataset):
 
 
 class Trainer(object):
+    """
+    Trainer class for CT-to-Xray diffusion model.
+
+    Features:
+    - tqdm progress bars for training monitoring
+    - wandb integration for experiment tracking
+    - Comprehensive validation metrics (PSNR, SSIM, LPIPS, MAE)
+    - Sample visualization with real vs generated comparisons
+    """
+
     def __init__(
         self,
         diffusion_model,
@@ -1118,7 +1136,6 @@ class Trainer(object):
         val_dataset=None,
         *,
         ema_decay=0.995,
-        num_frames=16,
         train_batch_size=32,
         train_lr=1e-4,
         train_num_steps=100000,
@@ -1127,12 +1144,16 @@ class Trainer(object):
         step_start_ema=2000,
         update_ema_every=10,
         save_and_sample_every=1000,
+        validate_every=500,
         results_folder='./results',
         num_sample_rows=1,
         max_grad_norm=None,
         num_workers=20,
-        lora = True,
-        lora_first = False,
+        lora=True,
+        lora_first=False,
+        use_wandb=True,
+        wandb_project='ct-to-xray-diffusion',
+        wandb_run_name=None,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1142,6 +1163,7 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
+        self.validate_every = validate_every
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
@@ -1150,78 +1172,112 @@ class Trainer(object):
         self.lora = lora
         self.lora_first = lora_first
 
-        image_size = diffusion_model.image_size
-        channels = diffusion_model.channels
-        num_frames = diffusion_model.num_frames
-
         self.cfg = cfg
+
+        # Setup training dataset
         if dataset:
             self.ds = dataset
-        if val_dataset:
-            self.val_ds = val_dataset
-            val_dl = DataLoader(self.val_ds, batch_size=train_batch_size,
-                        shuffle=True, pin_memory=True, num_workers=num_workers, prefetch_factor=2)
-            self.val_dl = cycle(val_dl)
         else:
             assert folder is not None, 'Provide a folder path to the dataset'
-            self.ds = Dataset(folder, image_size,
-                              channels=channels, num_frames=num_frames)
-        dl = DataLoader(self.ds, batch_size=train_batch_size,
-                        shuffle=True, pin_memory=True, num_workers=num_workers, prefetch_factor=2)
+            self.ds = Dataset(folder, diffusion_model.image_size,
+                              channels=diffusion_model.channels,
+                              num_frames=diffusion_model.num_frames)
 
+        dl = DataLoader(self.ds, batch_size=train_batch_size,
+                        shuffle=True, pin_memory=True,
+                        num_workers=num_workers, prefetch_factor=2)
         self.len_dataloader = len(dl)
         self.dl = cycle(dl)
-        print(f'found {len(self.ds)} videos as gif files at {folder}')
-        assert len(
-            self.ds) > 0, 'need to have at least 1 video to start training (although 1 is not great, try 100k)'
+
+        # Setup validation dataset
+        self.val_ds = val_dataset
+        if val_dataset:
+            val_dl = DataLoader(self.val_ds, batch_size=train_batch_size,
+                        shuffle=False, pin_memory=True,
+                        num_workers=num_workers, prefetch_factor=2)
+            self.val_dl = cycle(val_dl)
+
+        print(f'Training dataset size: {len(self.ds)}')
+        if val_dataset:
+            print(f'Validation dataset size: {len(self.val_ds)}')
+
+        assert len(self.ds) > 0, 'Need at least 1 sample to start training'
 
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
-
+        self.train_lr = train_lr
         self.step = 0
-
         self.amp = amp
         self.scaler = GradScaler('cuda', enabled=amp)
         self.max_grad_norm = max_grad_norm
-
         self.num_sample_rows = num_sample_rows
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok=True, parents=True)
 
+        # Initialize LPIPS metric for validation
+        self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='alex').cuda()
+        self.lpips_metric.eval()
+
+        # Wandb setup
+        self.use_wandb = use_wandb
+        if self.use_wandb:
+            wandb.init(
+                project=wandb_project,
+                name=wandb_run_name,
+                config={
+                    'train_batch_size': train_batch_size,
+                    'train_lr': train_lr,
+                    'train_num_steps': train_num_steps,
+                    'gradient_accumulate_every': gradient_accumulate_every,
+                    'ema_decay': ema_decay,
+                    'amp': amp,
+                    'image_size': self.image_size,
+                    'loss_type': diffusion_model.loss_type,
+                    'timesteps': diffusion_model.num_timesteps,
+                    'l1_weight': diffusion_model.l1_weight,
+                    'perceptual_weight': diffusion_model.perceptual_weight,
+                    'discriminator_weight': diffusion_model.discriminator_weight,
+                },
+                resume='allow'
+            )
+
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Reset EMA model parameters to match the current model."""
         self.ema_model.load_state_dict(self.model.state_dict())
 
     def step_ema(self):
+        """Update EMA model parameters."""
         if self.step < self.step_start_ema:
             self.reset_parameters()
             return
         self.ema.update_model_average(self.ema_model, self.model)
 
     def save(self, milestone):
+        """Save model checkpoint."""
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
             'ema': self.ema_model.state_dict(),
-            'scaler': self.scaler.state_dict()
+            'scaler': self.scaler.state_dict(),
+            'optimizer': self.opt.state_dict(),
         }
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        save_path = str(self.results_folder / f'model-{milestone}.pt')
+        torch.save(data, save_path)
+        tqdm.write(f'Saved checkpoint to {save_path}')
 
     def load(self, milestone, map_location=None, **kwargs):
+        """Load model checkpoint."""
         if milestone == -1:
             all_milestones = [int(p.stem.split('-')[-1])
                               for p in Path(self.results_folder).glob('**/*.pt')]
-            assert len(
-                all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
+            assert len(all_milestones) > 0, 'Need at least one milestone to load from'
             milestone = max(all_milestones)
 
-        if map_location:
-            data = torch.load(milestone, map_location=map_location)
-        else:
-            data = torch.load(milestone)
+        data = torch.load(milestone, map_location=map_location) if map_location else torch.load(milestone)
 
         self.step = data['step']
-        # Add LoRA
+
         if self.lora:
             if self.lora_first:
                 self.model.load_state_dict(data['model'], strict=False, **kwargs)
@@ -1240,82 +1296,288 @@ class Trainer(object):
         else:
             self.model.load_state_dict(data['model'], strict=False, **kwargs)
             self.ema_model.load_state_dict(data['ema'], strict=False, **kwargs)
+
         self.scaler.load_state_dict(data['scaler'])
+        if 'optimizer' in data:
+            self.opt.load_state_dict(data['optimizer'])
 
-    def train(
-        self,
-        prob_focus_present=0.,
-        focus_present_mask=None,
-        log_fn=noop
-    ):
-        assert callable(log_fn)
+        print(f'Loaded checkpoint from step {self.step}')
+
+    def compute_metrics(self, real_images, generated_images):
+        """
+        Compute validation metrics between real and generated images.
+
+        Args:
+            real_images: Ground truth X-ray images [B, 1, H, W] in range [0, 1]
+            generated_images: Generated X-ray images [B, 1, H, W] in range [0, 1]
+
+        Returns:
+            Dictionary with computed metrics
+        """
+        metrics = {}
+        batch_size = real_images.shape[0]
+
+        # Ensure images are in [0, 1] range
+        real_images = real_images.clamp(0, 1)
+        generated_images = generated_images.clamp(0, 1)
+
+        # PSNR, SSIM, MAE (computed per image, then averaged)
+        psnr_values = []
+        ssim_values = []
+        mae_values = []
+
+        for i in range(batch_size):
+            real_np = real_images[i, 0].cpu().numpy()
+            gen_np = generated_images[i, 0].cpu().numpy()
+
+            # PSNR
+            psnr_val = psnr_metric(real_np, gen_np, data_range=1.0)
+            psnr_values.append(psnr_val)
+
+            # SSIM
+            ssim_val = ssim_metric(real_np, gen_np, data_range=1.0)
+            ssim_values.append(ssim_val)
+
+            # MAE (Mean Absolute Error)
+            mae_val = np.abs(real_np - gen_np).mean()
+            mae_values.append(mae_val)
+
+        metrics['psnr'] = np.mean(psnr_values)
+        metrics['ssim'] = np.mean(ssim_values)
+        metrics['mae'] = np.mean(mae_values)
+
+        # LPIPS (needs 3 channels and range [-1, 1])
+        real_3ch = real_images.repeat(1, 3, 1, 1) * 2 - 1
+        gen_3ch = generated_images.repeat(1, 3, 1, 1) * 2 - 1
+        with torch.no_grad():
+            lpips_val = self.lpips_metric(real_3ch.cuda(), gen_3ch.cuda())
+        metrics['lpips'] = lpips_val.item()
+
+        # MSE
+        mse_val = F.mse_loss(real_images, generated_images)
+        metrics['mse'] = mse_val.item()
+
+        return metrics
+
+    @torch.no_grad()
+    def validate(self, num_batches=5):
+        """
+        Run validation and compute metrics.
+
+        Args:
+            num_batches: Number of validation batches to process
+
+        Returns:
+            Dictionary with averaged validation metrics
+        """
+        self.ema_model.eval()
+
+        all_metrics = {
+            'val/psnr': [], 'val/ssim': [], 'val/lpips': [],
+            'val/mae': [], 'val/mse': []
+        }
+
+        for _ in range(num_batches):
+            val_data = next(self.val_dl)
+            ct_cond = val_data['ct'].cuda()
+            real_xray = val_data['cxr'].cuda()
+
+            # Generate X-rays from CT condition
+            generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=ct_cond.shape[0])
+
+            # Compute metrics (real_xray should be in [0, 1])
+            metrics = self.compute_metrics(real_xray, generated_xray)
+
+            all_metrics['val/psnr'].append(metrics['psnr'])
+            all_metrics['val/ssim'].append(metrics['ssim'])
+            all_metrics['val/lpips'].append(metrics['lpips'])
+            all_metrics['val/mae'].append(metrics['mae'])
+            all_metrics['val/mse'].append(metrics['mse'])
+
+        # Average metrics
+        avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+        return avg_metrics
+
+    @torch.no_grad()
+    def save_and_log_samples(self, milestone):
+        """Save checkpoint and generate samples for visualization."""
+        self.ema_model.eval()
+
+        # Get validation data for sampling
+        val_data = next(self.val_dl)
+        ct_cond = val_data['ct'].cuda()
+        real_xray = val_data['cxr'].cuda()
+
+        num_samples = min(self.num_sample_rows ** 2, ct_cond.shape[0], 4)
+        ct_cond = ct_cond[:num_samples]
+        real_xray = real_xray[:num_samples]
+
+        # Generate samples
+        generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=num_samples)
+
+        # Compute metrics for these samples
+        metrics = self.compute_metrics(real_xray, generated_xray)
+
+        tqdm.write(
+            f"[Milestone {milestone}] PSNR: {metrics['psnr']:.2f} | "
+            f"SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f} | "
+            f"MAE: {metrics['mae']:.4f}"
+        )
+
+        # Create comparison figure
+        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for i in range(num_samples):
+            # Real X-ray
+            axes[i, 0].imshow(real_xray[i, 0].cpu().numpy(), cmap='gray')
+            axes[i, 0].set_title('Real X-ray', fontsize=10)
+            axes[i, 0].axis('off')
+
+            # Generated X-ray
+            axes[i, 1].imshow(generated_xray[i, 0].cpu().numpy(), cmap='gray')
+            axes[i, 1].set_title('Generated X-ray', fontsize=10)
+            axes[i, 1].axis('off')
+
+            # Difference map
+            diff = torch.abs(real_xray[i, 0] - generated_xray[i, 0]).cpu().numpy()
+            axes[i, 2].imshow(diff, cmap='hot')
+            axes[i, 2].set_title('Absolute Difference', fontsize=10)
+            axes[i, 2].axis('off')
+
+        plt.suptitle(f'Step {self.step} | PSNR: {metrics["psnr"]:.2f} | SSIM: {metrics["ssim"]:.4f}', fontsize=12)
+        plt.tight_layout()
+        sample_path = str(self.results_folder / f'sample-{milestone}.png')
+        plt.savefig(sample_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        # Log to wandb
+        if self.use_wandb:
+            wandb.log({
+                'samples/comparison': wandb.Image(sample_path),
+                'samples/psnr': metrics['psnr'],
+                'samples/ssim': metrics['ssim'],
+                'samples/lpips': metrics['lpips'],
+                'samples/mae': metrics['mae'],
+                'samples/mse': metrics['mse'],
+            }, step=self.step)
+
+        # Save checkpoint
+        self.save(milestone)
+
+    def train(self):
+        """Main training loop with tqdm progress bars and wandb logging."""
+
+        print(f'\n{"="*60}')
+        print(f'Starting training from step {self.step}')
+        print(f'Total steps: {self.train_num_steps}')
+        print(f'Batch size: {self.batch_size}')
+        print(f'Gradient accumulation: {self.gradient_accumulate_every}')
+        print(f'Effective batch size: {self.batch_size * self.gradient_accumulate_every}')
+        print(f'Results folder: {self.results_folder}')
+        print(f'Wandb logging: {self.use_wandb}')
+        print(f'{"="*60}\n')
+
+        # Create progress bar for total training
+        pbar = tqdm(
+            initial=self.step,
+            total=self.train_num_steps,
+            desc='Training',
+            unit='step',
+            dynamic_ncols=True
+        )
+
+        # Track running losses for logging
+        running_loss = 0.0
+        log_interval = 50  # Log to wandb every N steps
+
         while self.step < self.train_num_steps:
-            for i in range(self.gradient_accumulate_every):
+            self.model.train()
+            accumulated_loss = 0.0
+
+            # Gradient accumulation loop
+            for _ in range(self.gradient_accumulate_every):
                 data = next(self.dl)
+
                 with autocast('cuda', enabled=self.amp):
-                    loss = self.model(
-                        data,
-                        prob_focus_present=prob_focus_present,
-                        focus_present_mask=focus_present_mask
-                    )
+                    loss = self.model(data)
+                    scaled_loss = loss / self.gradient_accumulate_every
 
-                    self.scaler.scale(
-                        loss / self.gradient_accumulate_every).backward()
+                self.scaler.scale(scaled_loss).backward()
+                accumulated_loss += loss.item()
 
-                print(f'{self.step}: {loss.item()}')
-                #wandb.log({"loss": loss.item(), "step": self.step})
-            log = {'loss': loss.item()}
+            # Average loss for this step
+            step_loss = accumulated_loss / self.gradient_accumulate_every
+            running_loss += step_loss
 
+            # Gradient clipping
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm
+                )
+            else:
+                grad_norm = None
 
+            # Optimizer step
             self.scaler.step(self.opt)
             self.scaler.update()
             self.opt.zero_grad()
 
+            # EMA update
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{step_loss:.4f}',
+                'lr': f'{self.opt.param_groups[0]["lr"]:.2e}'
+            })
+            pbar.update(1)
+
+            # Log to wandb at intervals
+            if self.step % log_interval == 0 and self.step > 0:
+                avg_loss = running_loss / log_interval
+                log_dict = {
+                    'train/loss': avg_loss,
+                    'train/step': self.step,
+                    'train/lr': self.opt.param_groups[0]['lr'],
+                    'train/epoch': self.step / self.len_dataloader,
+                }
+                if grad_norm is not None:
+                    log_dict['train/grad_norm'] = grad_norm.item()
+
+                if self.use_wandb:
+                    wandb.log(log_dict, step=self.step)
+
+                running_loss = 0.0
+
+            # Validation
+            if self.val_ds is not None and self.step % self.validate_every == 0 and self.step > 0:
+                val_metrics = self.validate(num_batches=3)
+
+                tqdm.write(
+                    f"[Step {self.step}] Val PSNR: {val_metrics['val/psnr']:.2f} | "
+                    f"Val SSIM: {val_metrics['val/ssim']:.4f} | "
+                    f"Val LPIPS: {val_metrics['val/lpips']:.4f}"
+                )
+
+                if self.use_wandb:
+                    wandb.log(val_metrics, step=self.step)
+
+            # Save and sample
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                self.ema_model.eval()
+                milestone = self.step // self.save_and_sample_every
+                self.save_and_log_samples(milestone)
 
-                with torch.no_grad():
-                    milestone = self.step // self.save_and_sample_every
-                    num_samples = self.num_sample_rows ** 2
-                    batches = num_to_groups(num_samples, self.batch_size)
-
-                    # Get CT condition from validation data
-                    sampled_data = next(self.val_dl)
-                    ct_cond = sampled_data['ct'].cuda()  # CT is now the condition
-
-                    # Sample X-rays conditioned on CT
-                    all_xrays_list = list(
-                        map(lambda n: self.ema_model.sample(cond_ct=ct_cond[:n], batch_size=n), batches))
-                    all_xrays_list = torch.cat(all_xrays_list, dim=0)
-
-                # Pad for visualization
-                all_xrays_list = F.pad(all_xrays_list, (2, 2, 2, 2))
-
-                # Save sampled X-rays as a grid image
-                path = str(self.results_folder / f'sample-{milestone}.jpg')
-                plt.figure(figsize=(50, 50))
-                cols = 5
-                B, C, H, W = all_xrays_list.shape
-                for num, xray in enumerate(all_xrays_list.cpu()):
-                    plt.subplot(
-                        math.ceil(B / cols), cols, num + 1)
-                    plt.axis('off')
-                    plt.imshow(xray[0], cmap='gray')
-                plt.savefig(path)
-                plt.close()
-
-                log = {**log, 'sample': path}
-
-                self.save(milestone)
-
-            log_fn(log)
             self.step += 1
 
-        print('training completed')
+        pbar.close()
+
+        # Final save
+        self.save('final')
+        tqdm.write('\nTraining completed!')
+
+        if self.use_wandb:
+            wandb.finish()

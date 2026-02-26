@@ -39,7 +39,7 @@ def run(cfg: DictConfig):
     # Get datasets
     train_dataset, val_dataset, _ = get_dataset(cfg)
 
-    # Create trainer
+    # Create trainer with wandb integration and validation metrics
     trainer = Trainer(
         diffusion,
         cfg=cfg,
@@ -47,6 +47,7 @@ def run(cfg: DictConfig):
         val_dataset=val_dataset,
         train_batch_size=cfg.model.batch_size,
         save_and_sample_every=cfg.model.save_and_sample_every,
+        validate_every=cfg.model.get('validate_every', 500),
         train_lr=cfg.model.train_lr,
         train_num_steps=cfg.model.train_num_steps,
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
@@ -56,8 +57,12 @@ def run(cfg: DictConfig):
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
         max_grad_norm=cfg.model.max_grad_norm,
-        lora = cfg.model.lora,
-        lora_first = cfg.model.lora_first
+        lora=cfg.model.lora,
+        lora_first=cfg.model.lora_first,
+        # Wandb configuration
+        use_wandb=cfg.model.get('use_wandb', True),
+        wandb_project=cfg.model.get('wandb_project', 'ct-to-xray-diffusion'),
+        wandb_run_name=cfg.model.get('wandb_run_name', None),
     )
 
     # Load checkpoint if specified
