@@ -37,7 +37,7 @@ def run(cfg: DictConfig):
     ).cuda()
 
     # Get datasets
-    train_dataset, val_dataset, _ = get_dataset(cfg)
+    train_dataset, val_dataset, test_dataset, _ = get_dataset(cfg)
 
     # Create trainer with wandb integration and validation metrics
     trainer = Trainer(
@@ -45,6 +45,7 @@ def run(cfg: DictConfig):
         cfg=cfg,
         dataset=train_dataset,
         val_dataset=val_dataset,
+        test_dataset=test_dataset,
         train_batch_size=cfg.model.batch_size,
         save_and_sample_every=cfg.model.save_and_sample_every,
         validate_every=cfg.model.get('validate_every', 500),

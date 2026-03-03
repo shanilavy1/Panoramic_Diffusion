@@ -1134,6 +1134,7 @@ class Trainer(object):
         folder=None,
         dataset=None,
         val_dataset=None,
+        test_dataset=None,
         *,
         ema_decay=0.995,
         train_batch_size=32,
@@ -1197,9 +1198,18 @@ class Trainer(object):
                         num_workers=num_workers, prefetch_factor=2)
             self.val_dl = cycle(val_dl)
 
+        # Setup test dataset
+        self.test_ds = test_dataset
+        if test_dataset:
+            self.test_dl = DataLoader(self.test_ds, batch_size=train_batch_size,
+                        shuffle=False, pin_memory=True,
+                        num_workers=num_workers, prefetch_factor=2)
+
         print(f'Training dataset size: {len(self.ds)}')
         if val_dataset:
             print(f'Validation dataset size: {len(self.val_ds)}')
+        if test_dataset:
+            print(f'Test dataset size: {len(self.test_ds)}')
 
         assert len(self.ds) > 0, 'Need at least 1 sample to start training'
 
@@ -1399,6 +1409,85 @@ class Trainer(object):
         return avg_metrics
 
     @torch.no_grad()
+    def test(self):
+        """
+        Run final evaluation on the test set.
+
+        This method should only be called once after training is complete.
+        It evaluates the model on the entire test dataset and logs results.
+
+        Returns:
+            Dictionary with averaged test metrics
+        """
+        if self.test_ds is None:
+            print("No test dataset available. Skipping test evaluation.")
+            return None
+
+        self.ema_model.eval()
+
+        all_metrics = {
+            'test/psnr': [], 'test/ssim': [], 'test/lpips': [],
+            'test/mae': [], 'test/mse': []
+        }
+
+        print(f'\n{"="*60}')
+        print('Running final evaluation on test set...')
+        print(f'Test dataset size: {len(self.test_ds)}')
+        print(f'{"="*60}\n')
+
+        # Iterate over entire test dataset
+        test_pbar = tqdm(self.test_dl, desc='Testing', unit='batch')
+
+        for test_data in test_pbar:
+            ct_cond = test_data['ct'].cuda()
+            real_xray = test_data['cxr'].cuda()
+
+            # Generate X-rays from CT condition
+            generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=ct_cond.shape[0])
+
+            # Compute metrics
+            metrics = self.compute_metrics(real_xray, generated_xray)
+
+            all_metrics['test/psnr'].append(metrics['psnr'])
+            all_metrics['test/ssim'].append(metrics['ssim'])
+            all_metrics['test/lpips'].append(metrics['lpips'])
+            all_metrics['test/mae'].append(metrics['mae'])
+            all_metrics['test/mse'].append(metrics['mse'])
+
+            # Update progress bar
+            test_pbar.set_postfix({
+                'psnr': f'{metrics["psnr"]:.2f}',
+                'ssim': f'{metrics["ssim"]:.4f}'
+            })
+
+        # Average metrics over entire test set
+        avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+
+        print(f'\n{"="*60}')
+        print('Test Results:')
+        print(f'  PSNR:  {avg_metrics["test/psnr"]:.2f}')
+        print(f'  SSIM:  {avg_metrics["test/ssim"]:.4f}')
+        print(f'  LPIPS: {avg_metrics["test/lpips"]:.4f}')
+        print(f'  MAE:   {avg_metrics["test/mae"]:.4f}')
+        print(f'  MSE:   {avg_metrics["test/mse"]:.4f}')
+        print(f'{"="*60}\n')
+
+        # Log to wandb
+        if self.use_wandb:
+            wandb.log(avg_metrics, step=self.step)
+
+            # Create summary table
+            wandb.run.summary.update({
+                'final_test_psnr': avg_metrics['test/psnr'],
+                'final_test_ssim': avg_metrics['test/ssim'],
+                'final_test_lpips': avg_metrics['test/lpips'],
+                'final_test_mae': avg_metrics['test/mae'],
+                'final_test_mse': avg_metrics['test/mse'],
+            })
+
+        return avg_metrics
+
+    @torch.no_grad()
     def save_and_log_samples(self, milestone):
         """Save checkpoint and generate samples for visualization."""
         self.ema_model.eval()
@@ -1578,6 +1667,9 @@ class Trainer(object):
         # Final save
         self.save('final')
         tqdm.write('\nTraining completed!')
+
+        # Run final evaluation on test set
+        self.test()
 
         if self.use_wandb:
             wandb.finish()
