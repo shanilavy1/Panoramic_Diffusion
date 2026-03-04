@@ -1003,10 +1003,10 @@ class GaussianDiffusion(nn.Module):
             Diffusion loss
         """
         ct = x['ct'].cuda()      # CT is the condition [B, 4, 128, 32, 32]
-        xray = x['cxr'].cuda()   # X-ray is the diffusion target [B, 1, 224, 224]
+        xray = x['cxr'].cuda()   # X-ray is the diffusion target [B, 1, 224, 224], already in [-1, 1]
 
-        # Normalize X-ray to [-1, 1] for diffusion
-        xray = normalize_img(xray)
+        # X-ray is already normalized to [-1, 1] by preprocess_xray.py (z-score + clip + scale)
+        # No additional normalization needed here
 
         b, device, img_size = xray.shape[0], xray.device, self.image_size
 
@@ -1403,10 +1403,13 @@ class Trainer(object):
             ct_cond = val_data['ct'].cuda()
             real_xray = val_data['cxr'].cuda()
 
-            # Generate X-rays from CT condition
+            # Convert real X-ray from [-1, 1] to [0, 1] to match sample() output
+            real_xray = (real_xray + 1.0) / 2.0
+
+            # Generate X-rays from CT condition (output is [0, 1])
             generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=ct_cond.shape[0])
 
-            # Compute metrics (real_xray should be in [0, 1])
+            # Compute metrics (both in [0, 1])
             metrics = self.compute_metrics(real_xray, generated_xray)
 
             all_metrics['val/psnr'].append(metrics['psnr'])
@@ -1458,10 +1461,13 @@ class Trainer(object):
             ct_cond = test_data['ct'].cuda()
             real_xray = test_data['cxr'].cuda()
 
-            # Generate X-rays from CT condition
+            # Convert real X-ray from [-1, 1] to [0, 1] to match sample() output
+            real_xray = (real_xray + 1.0) / 2.0
+
+            # Generate X-rays from CT condition (output is [0, 1])
             generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=ct_cond.shape[0])
 
-            # Compute metrics
+            # Compute metrics (both in [0, 1])
             metrics = self.compute_metrics(real_xray, generated_xray)
 
             all_metrics['test/psnr'].append(metrics['psnr'])
@@ -1513,14 +1519,17 @@ class Trainer(object):
         ct_cond = val_data['ct'].cuda()
         real_xray = val_data['cxr'].cuda()
 
+        # Convert real X-ray from [-1, 1] to [0, 1] to match sample() output
+        real_xray = (real_xray + 1.0) / 2.0
+
         num_samples = min(self.num_sample_rows ** 2, ct_cond.shape[0], 4)
         ct_cond = ct_cond[:num_samples]
         real_xray = real_xray[:num_samples]
 
-        # Generate samples
+        # Generate samples (output is [0, 1])
         generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=num_samples)
 
-        # Compute metrics for these samples
+        # Compute metrics (both in [0, 1])
         metrics = self.compute_metrics(real_xray, generated_xray)
 
         tqdm.write(
