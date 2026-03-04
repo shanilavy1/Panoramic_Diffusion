@@ -1121,10 +1121,13 @@ class Trainer(object):
     Trainer class for CT-to-Xray diffusion model.
 
     Features:
+    - Epoch-aware training loop with per-epoch wandb logging
+    - Full validation on entire validation set every epoch
     - tqdm progress bars for training monitoring
     - wandb integration for experiment tracking
-    - Comprehensive validation metrics (PSNR, SSIM, LPIPS, MAE)
+    - Comprehensive validation metrics (PSNR, SSIM, LPIPS, MAE, MSE)
     - Sample visualization with real vs generated comparisons
+    - Final test evaluation after training completes
     """
 
     def __init__(
@@ -1136,25 +1139,24 @@ class Trainer(object):
         val_dataset=None,
         test_dataset=None,
         *,
-        ema_decay=0.995,
-        train_batch_size=32,
-        train_lr=1e-4,
-        train_num_steps=100000,
-        gradient_accumulate_every=2,
-        amp=False,
-        step_start_ema=2000,
-        update_ema_every=10,
-        save_and_sample_every=1000,
-        validate_every=500,
-        results_folder='./results',
-        num_sample_rows=1,
-        max_grad_norm=None,
-        num_workers=20,
-        lora=True,
-        lora_first=False,
-        use_wandb=True,
-        wandb_project='ct-to-xray-diffusion',
-        wandb_run_name=None,
+        ema_decay,
+        train_batch_size,
+        train_lr,
+        train_num_steps,
+        gradient_accumulate_every,
+        amp,
+        step_start_ema,
+        update_ema_every,
+        save_and_sample_every,
+        results_folder,
+        num_sample_rows,
+        max_grad_norm,
+        num_workers,
+        lora,
+        lora_first,
+        use_wandb,
+        wandb_project,
+        wandb_run_name,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1164,7 +1166,6 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
-        self.validate_every = validate_every
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
@@ -1184,28 +1185,29 @@ class Trainer(object):
                               channels=diffusion_model.channels,
                               num_frames=diffusion_model.num_frames)
 
-        dl = DataLoader(self.ds, batch_size=train_batch_size,
+        self.train_dl = DataLoader(self.ds, batch_size=train_batch_size,
                         shuffle=True, pin_memory=True,
                         num_workers=num_workers, prefetch_factor=2)
-        self.len_dataloader = len(dl)
-        self.dl = cycle(dl)
+        self.steps_per_epoch = len(self.train_dl)
 
-        # Setup validation dataset
+        # Setup validation dataset (non-cycled — iterate fully each epoch)
         self.val_ds = val_dataset
+        self.val_dl = None
         if val_dataset:
-            val_dl = DataLoader(self.val_ds, batch_size=train_batch_size,
+            self.val_dl = DataLoader(self.val_ds, batch_size=train_batch_size,
                         shuffle=False, pin_memory=True,
                         num_workers=num_workers, prefetch_factor=2)
-            self.val_dl = cycle(val_dl)
 
-        # Setup test dataset
+        # Setup test dataset (non-cycled — iterate fully once)
         self.test_ds = test_dataset
+        self.test_dl = None
         if test_dataset:
             self.test_dl = DataLoader(self.test_ds, batch_size=train_batch_size,
                         shuffle=False, pin_memory=True,
                         num_workers=num_workers, prefetch_factor=2)
 
         print(f'Training dataset size: {len(self.ds)}')
+        print(f'Steps per epoch: {self.steps_per_epoch}')
         if val_dataset:
             print(f'Validation dataset size: {len(self.val_ds)}')
         if test_dataset:
@@ -1216,6 +1218,7 @@ class Trainer(object):
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.train_lr = train_lr
         self.step = 0
+        self.epoch = 0
         self.amp = amp
         self.scaler = GradScaler('cuda', enabled=amp)
         self.max_grad_norm = max_grad_norm
@@ -1240,12 +1243,21 @@ class Trainer(object):
                     'gradient_accumulate_every': gradient_accumulate_every,
                     'ema_decay': ema_decay,
                     'amp': amp,
+                    'step_start_ema': step_start_ema,
+                    'update_ema_every': update_ema_every,
+                    'save_and_sample_every': save_and_sample_every,
+                    'max_grad_norm': max_grad_norm,
                     'image_size': self.image_size,
                     'loss_type': diffusion_model.loss_type,
                     'timesteps': diffusion_model.num_timesteps,
                     'l1_weight': diffusion_model.l1_weight,
                     'perceptual_weight': diffusion_model.perceptual_weight,
                     'discriminator_weight': diffusion_model.discriminator_weight,
+                    'dataset_size': len(self.ds),
+                    'val_dataset_size': len(self.val_ds) if self.val_ds else 0,
+                    'test_dataset_size': len(self.test_ds) if self.test_ds else 0,
+                    'steps_per_epoch': self.steps_per_epoch,
+                    'lora': lora,
                 },
                 resume='allow'
             )
@@ -1267,6 +1279,7 @@ class Trainer(object):
         """Save model checkpoint."""
         data = {
             'step': self.step,
+            'epoch': self.epoch,
             'model': self.model.state_dict(),
             'ema': self.ema_model.state_dict(),
             'scaler': self.scaler.state_dict(),
@@ -1287,6 +1300,7 @@ class Trainer(object):
         data = torch.load(milestone, map_location=map_location) if map_location else torch.load(milestone)
 
         self.step = data['step']
+        self.epoch = data.get('epoch', self.step // self.steps_per_epoch)
 
         if self.lora:
             if self.lora_first:
@@ -1370,12 +1384,9 @@ class Trainer(object):
         return metrics
 
     @torch.no_grad()
-    def validate(self, num_batches=5):
+    def validate(self):
         """
-        Run validation and compute metrics.
-
-        Args:
-            num_batches: Number of validation batches to process
+        Run validation on the entire validation dataset.
 
         Returns:
             Dictionary with averaged validation metrics
@@ -1387,8 +1398,8 @@ class Trainer(object):
             'val/mae': [], 'val/mse': []
         }
 
-        for _ in range(num_batches):
-            val_data = next(self.val_dl)
+        val_pbar = tqdm(self.val_dl, desc='Validation', unit='batch', leave=False)
+        for val_data in val_pbar:
             ct_cond = val_data['ct'].cuda()
             real_xray = val_data['cxr'].cuda()
 
@@ -1403,6 +1414,11 @@ class Trainer(object):
             all_metrics['val/lpips'].append(metrics['lpips'])
             all_metrics['val/mae'].append(metrics['mae'])
             all_metrics['val/mse'].append(metrics['mse'])
+
+            val_pbar.set_postfix({
+                'psnr': f'{metrics["psnr"]:.2f}',
+                'ssim': f'{metrics["ssim"]:.4f}'
+            })
 
         # Average metrics
         avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
@@ -1492,8 +1508,8 @@ class Trainer(object):
         """Save checkpoint and generate samples for visualization."""
         self.ema_model.eval()
 
-        # Get validation data for sampling
-        val_data = next(self.val_dl)
+        # Get first batch from validation data for sampling
+        val_data = next(iter(self.val_dl))
         ct_cond = val_data['ct'].cuda()
         real_xray = val_data['cxr'].cuda()
 
@@ -1556,11 +1572,21 @@ class Trainer(object):
         self.save(milestone)
 
     def train(self):
-        """Main training loop with tqdm progress bars and wandb logging."""
+        """
+        Main training loop — epoch-based with per-epoch logging and validation.
+
+        - Logs average training loss to wandb every epoch
+        - Runs full validation on entire validation set every epoch
+        - Saves checkpoints and samples at step intervals (save_and_sample_every)
+        """
+        total_epochs = self.train_num_steps // self.steps_per_epoch
+        start_epoch = self.step // self.steps_per_epoch
 
         print(f'\n{"="*60}')
-        print(f'Starting training from step {self.step}')
+        print(f'Starting training from step {self.step} (epoch {start_epoch})')
         print(f'Total steps: {self.train_num_steps}')
+        print(f'Steps per epoch: {self.steps_per_epoch}')
+        print(f'Estimated total epochs: {total_epochs}')
         print(f'Batch size: {self.batch_size}')
         print(f'Gradient accumulation: {self.gradient_accumulate_every}')
         print(f'Effective batch size: {self.batch_size * self.gradient_accumulate_every}')
@@ -1577,90 +1603,106 @@ class Trainer(object):
             dynamic_ncols=True
         )
 
-        # Track running losses for logging
-        running_loss = 0.0
-        log_interval = 50  # Log to wandb every N steps
-
         while self.step < self.train_num_steps:
+            # ---- Epoch start ----
             self.model.train()
-            accumulated_loss = 0.0
+            epoch_loss = 0.0
+            epoch_steps = 0
+            epoch_grad_norm = 0.0
 
-            # Gradient accumulation loop
-            for _ in range(self.gradient_accumulate_every):
-                data = next(self.dl)
+            for batch_data in self.train_dl:
+                if self.step >= self.train_num_steps:
+                    break
 
-                with autocast('cuda', enabled=self.amp):
-                    loss = self.model(data)
-                    scaled_loss = loss / self.gradient_accumulate_every
+                accumulated_loss = 0.0
 
-                self.scaler.scale(scaled_loss).backward()
-                accumulated_loss += loss.item()
+                # Gradient accumulation loop
+                for _ in range(self.gradient_accumulate_every):
+                    with autocast('cuda', enabled=self.amp):
+                        loss = self.model(batch_data)
+                        scaled_loss = loss / self.gradient_accumulate_every
 
-            # Average loss for this step
-            step_loss = accumulated_loss / self.gradient_accumulate_every
-            running_loss += step_loss
+                    self.scaler.scale(scaled_loss).backward()
+                    accumulated_loss += loss.item()
 
-            # Gradient clipping
-            if exists(self.max_grad_norm):
-                self.scaler.unscale_(self.opt)
-                grad_norm = nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.max_grad_norm
-                )
-            else:
-                grad_norm = None
+                # Average loss for this step
+                step_loss = accumulated_loss / self.gradient_accumulate_every
+                epoch_loss += step_loss
+                epoch_steps += 1
 
-            # Optimizer step
-            self.scaler.step(self.opt)
-            self.scaler.update()
-            self.opt.zero_grad()
+                # Gradient clipping
+                if exists(self.max_grad_norm):
+                    self.scaler.unscale_(self.opt)
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
+                    )
+                    epoch_grad_norm += grad_norm.item()
+                else:
+                    grad_norm = None
 
-            # EMA update
-            if self.step % self.update_ema_every == 0:
-                self.step_ema()
+                # Optimizer step
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                self.opt.zero_grad()
 
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f'{step_loss:.4f}',
-                'lr': f'{self.opt.param_groups[0]["lr"]:.2e}'
-            })
-            pbar.update(1)
+                # EMA update
+                if self.step % self.update_ema_every == 0:
+                    self.step_ema()
 
-            # Log to wandb at intervals
-            if self.step % log_interval == 0 and self.step > 0:
-                avg_loss = running_loss / log_interval
-                log_dict = {
-                    'train/loss': avg_loss,
-                    'train/step': self.step,
-                    'train/lr': self.opt.param_groups[0]['lr'],
-                    'train/epoch': self.step / self.len_dataloader,
-                }
-                if grad_norm is not None:
-                    log_dict['train/grad_norm'] = grad_norm.item()
+                # Update progress bar
+                pbar.set_postfix({
+                    'epoch': self.epoch,
+                    'loss': f'{step_loss:.4f}',
+                    'lr': f'{self.opt.param_groups[0]["lr"]:.2e}'
+                })
+                pbar.update(1)
 
-                if self.use_wandb:
-                    wandb.log(log_dict, step=self.step)
+                # Save and sample (step-based)
+                if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    milestone = self.step // self.save_and_sample_every
+                    self.save_and_log_samples(milestone)
+                    self.model.train()
 
-                running_loss = 0.0
+                self.step += 1
 
-            # Validation
-            if self.val_ds is not None and self.step % self.validate_every == 0 and self.step > 0:
-                val_metrics = self.validate(num_batches=3)
+            # ---- Epoch end ----
+            if epoch_steps == 0: #empty dataloader
+                break
+
+            avg_epoch_loss = epoch_loss / epoch_steps
+            avg_epoch_grad_norm = epoch_grad_norm / epoch_steps if exists(self.max_grad_norm) else None
+
+            # Log training metrics for this epoch
+            epoch_log = {
+                'train/epoch_loss': avg_epoch_loss,
+                'train/epoch': self.epoch,
+                'train/step': self.step,
+                'train/lr': self.opt.param_groups[0]['lr'],
+            }
+            if avg_epoch_grad_norm is not None:
+                epoch_log['train/grad_norm'] = avg_epoch_grad_norm
+
+            tqdm.write(
+                f"[Epoch {self.epoch}] Train Loss: {avg_epoch_loss:.4f} | "
+                f"Step: {self.step}"
+            )
+
+            # Run full validation every epoch
+            if self.val_dl is not None:
+                val_metrics = self.validate()
 
                 tqdm.write(
-                    f"[Step {self.step}] Val PSNR: {val_metrics['val/psnr']:.2f} | "
+                    f"[Epoch {self.epoch}] Val PSNR: {val_metrics['val/psnr']:.2f} | "
                     f"Val SSIM: {val_metrics['val/ssim']:.4f} | "
-                    f"Val LPIPS: {val_metrics['val/lpips']:.4f}"
+                    f"Val LPIPS: {val_metrics['val/lpips']:.4f} | "
+                    f"Val MAE: {val_metrics['val/mae']:.4f}"
                 )
+                epoch_log.update(val_metrics)
 
-                if self.use_wandb:
-                    wandb.log(val_metrics, step=self.step)
+            if self.use_wandb:
+                wandb.log(epoch_log, step=self.step)
 
-            # Save and sample
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                milestone = self.step // self.save_and_sample_every
-                self.save_and_log_samples(milestone)
-
-            self.step += 1
+            self.epoch += 1
 
         pbar.close()
 
