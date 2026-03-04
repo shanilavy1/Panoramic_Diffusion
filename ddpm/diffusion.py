@@ -681,16 +681,16 @@ class GaussianDiffusion(nn.Module):
         *,
         image_size,
         num_frames,
+        channels,
+        timesteps,
+        loss_type,
+        l1_weight,
+        perceptual_weight,
+        discriminator_weight,
+        name_dataset,
         text_use_bert_cls=False,
-        channels=3,
-        timesteps=1000,
-        loss_type='l1',
         use_dynamic_thres=False,  # from the Imagen paper
         dynamic_thres_percentile=0.9,
-        l1_weight = 1.0,
-        perceptual_weight = 1.0,
-        discriminator_weight = 0.0,
-        name_dataset = 'XRAY_CTPA',
     ):
         super().__init__()
         self.channels = channels
@@ -1666,7 +1666,7 @@ class Trainer(object):
                 self.step += 1
 
             # ---- Epoch end ----
-            if epoch_steps == 0: #empty dataloader
+            if epoch_steps == 0: # empty dataloader
                 break
 
             avg_epoch_loss = epoch_loss / epoch_steps
