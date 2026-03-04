@@ -84,7 +84,7 @@ class XrayCTPADataset(data.Dataset):
         # Load matching Xray 2D image
         xray = torch.from_numpy(np.load(os.path.join(self.xrays, cxr_accession + '.npy'))).float()
 
-        if self.mode == "train" or self.mode == "test":
+        if self.mode in ("train", "val", "test"):
             return {'ct': ctout, 'cxr': xray}
-        else: #if self.mode == "infer"
+        else:  # infer mode
             return {'ct': ctout, 'cxr': xray, 'ct_accession': ct_accession, 'cxr_accession': cxr_accession}
