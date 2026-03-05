@@ -4,7 +4,7 @@ def excel_to_clean_csv(excel_path, csv_path):
     df = pd.read_excel(excel_path)
 
     # Columns to clean
-    cols_to_clean = ["CT_ACCESSION_COL", "XRAY_ACCESSION_COL"]
+    cols_to_clean = ["CT_accession_number", "XRAY_Accession_number"]
 
     for col in cols_to_clean:
         df[col] = df[col].apply(clean_list_cell)
@@ -24,9 +24,10 @@ def clean_list_cell(x):
     if isinstance(x, (int, float)):
         return int(x)
 
-    # Convert string like "[12345]" or "[12345,]"
+    # Convert string like "[12345]", "['12345']", or "[12345,]"
     x = str(x).strip()
-    x = x.replace('[', '').replace(']', '').replace(',', '').strip()
+    x = x.replace('[', '').replace(']', '').replace(',', '')
+    x = x.replace("'", '').replace('"', '').strip()
 
     return x
 

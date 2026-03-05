@@ -63,8 +63,8 @@ class XrayCTPADataset(data.Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        ct_accession = self.data.loc[idx, CT_ACCESSION_COL]
-        cxr_accession = self.data.loc[idx, XRAY_ACCESSION_COL]
+        ct_accession = str(self.data.loc[idx, CT_ACCESSION_COL]).strip()
+        cxr_accession = str(self.data.loc[idx, XRAY_ACCESSION_COL]).strip()
 
         # Load CT (latent or volume)
         ct = np.load(os.path.join(self.cts, ct_accession + '.npy')).astype(np.float32)
