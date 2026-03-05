@@ -277,15 +277,17 @@ class UNet(nn.Module):
         for i in range(len(self.encoders)):
             x[i + 1] = self.encoders[i](x[i], time_emb, cond_map=enc_cond[i])
 
-        # Inject CT conditioning at bottleneck (add to deepest encoder output)
-        x[-1] = x[-1] + cond_bottleneck
-
         # -------- Decoder -----------
-        # Decoder mirrors encoder: index i in decoders corresponds to upsampling from level i+1 to level i
-        # Inject CT at decoder levels that correspond to encoder levels with conditioning
-        dec_cond = [None, None, cond_level2, cond_level3]
+        # In UpBlock.forward, cond_map is added to x_enc (= x[i]), so we must
+        # match x[i]'s spatial size and channels:
+        #   i=4: x_enc=x[4] is 14×14, 512ch → cond_bottleneck (14×14, 512ch)
+        #   i=3: x_enc=x[3] is 28×28, 256ch → cond_level3 (28×28, 256ch)
+        #   i=2: x_enc=x[2] is 56×56, 128ch → cond_level2 (56×56, 128ch)
+        #   i=1: x_enc=x[1] is 112×112, 64ch → None
+        dec_cond = {4: cond_bottleneck, 3: cond_level3, 2: cond_level2}
         for i in range(len(self.decoders), 0, -1):
-            x[i - 1] = self.decoders[i - 1](x[i - 1], x[i], time_emb, cond_map=dec_cond[i - 1])
+            cond_map_i = dec_cond.get(i, None)
+            x[i - 1] = self.decoders[i - 1](x[i - 1], x[i], time_emb, cond_map=cond_map_i)
 
         # ---------Out-Convolution ------------
         y_hor = self.outc(x[0])
