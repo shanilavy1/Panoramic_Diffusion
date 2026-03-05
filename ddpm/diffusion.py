@@ -847,7 +847,7 @@ class GaussianDiffusion(nn.Module):
         Sample 2D X-ray images conditioned on CT.
 
         Args:
-            cond_ct: VAE-encoded CT tensor of shape [B, 4, 128, 32, 32]
+            cond_ct: VAE-encoded CT tensor of shape [B, 4, 128, 56, 56]
             cond_scale: conditioning scale (not used in current implementation)
             batch_size: batch size for sampling
 
@@ -948,7 +948,7 @@ class GaussianDiffusion(nn.Module):
         Args:
             x_start: Target X-ray images [B, C, H, W]
             t: Timestep indices [B]
-            cond_ct: VAE-encoded CT condition [B, 4, 128, 32, 32]
+            cond_ct: VAE-encoded CT condition [B, 4, 128, 56, 56]
             noise: Optional noise tensor
 
         Returns:
@@ -996,13 +996,13 @@ class GaussianDiffusion(nn.Module):
 
         Args:
             x: Dictionary containing 'ct' and 'cxr' tensors
-                - ct: VAE-encoded CT [B, 4, 128, 32, 32]
+                - ct: VAE-encoded CT [B, 4, 128, 56, 56]
                 - cxr: X-ray images [B, 1, 224, 224]
 
         Returns:
             Diffusion loss
         """
-        ct = x['ct'].cuda()      # CT is the condition [B, 4, 128, 32, 32]
+        ct = x['ct'].cuda()      # CT is the condition [B, 4, 128, 56, 56]
         xray = x['cxr'].cuda()   # X-ray is the diffusion target [B, 1, 224, 224], already in [-1, 1]
 
         # X-ray is already normalized to [-1, 1] by preprocess_xray.py (z-score + clip + scale)

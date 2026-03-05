@@ -55,10 +55,10 @@ def encode_ctpa(ct, vae):
     latents = []
     with torch.no_grad():
         for i in range(ct.shape[2]):
-            slice = make_rgb(ct[:,:,i,:,:]) #(1,3,256,256)
-            latent = vae.encode(slice.to(device, dtype=weight_dtype)).latent_dist.sample() #(1,4,32,32)
+            slice = make_rgb(ct[:,:,i,:,:]) #(1,3,448,448)
+            latent = vae.encode(slice.to(device, dtype=weight_dtype)).latent_dist.sample() #(1,4,56,56)
             latents.append(latent)
-        latents = torch.stack(latents, dim=4).squeeze()#.unsqueeze(0)#.permute(0,2,3,4,1) #(4,32,32, num_slices)
+        latents = torch.stack(latents, dim=4).squeeze()#.unsqueeze(0)#.permute(0,2,3,4,1) #(4,56,56, num_slices)
 
         latents = latents.detach().cpu().numpy()
         print("latents shape", latents.shape)
@@ -114,9 +114,9 @@ def preprocess_ctpa(img, attr, num_slices=150):
     # Resample
     spacing = attr['Spacing']
     img_resampled = resample_volume(img_cropped, spacing, [1,1,1])
-    # Rescale
-    img_resize = resize_volume(img_resampled, [128, 256, 256])
-    # noramlize and window Hounsfield Units 
+    # Rescale — 448x448 so VAE latent spatial size = 56x56 (448/8), matching UNet level 2
+    img_resize = resize_volume(img_resampled, [128, 448, 448])
+    # noramlize and window Hounsfield Units
     img_normalized = normalize(img_resize)
 
     return img_normalized

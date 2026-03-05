@@ -36,12 +36,12 @@ class CT3Dto2DProjector(nn.Module):
 
     def forward(self, ct):
         """
-        ct VAE latent: [B, 4, 128, 32, 32]
-        returns: [B, out_ch, 32, 32]
+        ct VAE latent: [B, 4, 128, 56, 56]
+        returns: [B, out_ch, 56, 56]
         """
         x = self.encoder(ct)
-        x = self.depth_compress(x)   # [B, out_ch, 1, 32, 32], compress depth (128 → 1) and produce rich feature channels
-        return x.squeeze(2)          # [B, 256, 32, 32]
+        x = self.depth_compress(x)   # [B, out_ch, 1, 56, 56], compress depth (128 → 1) and produce rich feature channels
+        return x.squeeze(2)          # [B, 256, 56, 56]
 
 
 # Down Block
@@ -226,44 +226,66 @@ class UNet(nn.Module):
         ])
 
         # ---- CT conditioning ----
-        self.ct_projector = CT3Dto2DProjector(in_ch=4) #ct_latent: [4, 128, 32, 32]
+        # CT projector outputs [B, 256, 56, 56] (from VAE latent of 448x448 CT slices)
+        # UNet encoder spatial sizes: level0=224, level1=112, level2=56, level3=28, bottleneck=14
+        # CT condition injected only at levels 2, 3, 4 (56→28→14 via avg_pool2d)
+        # Levels 0 and 1 (224, 112) get no CT conditioning — they handle fine X-ray details
+        self.ct_projector = CT3Dto2DProjector(in_ch=4, out_ch=256) # ct_latent: [4, 128, 56, 56]
 
         self.cond_down = nn.ModuleList([
-            nn.Conv2d(256, hid_chs[0], kernel_size=1),
-            nn.Conv2d(256, hid_chs[1], kernel_size=1),
-            nn.Conv2d(256, hid_chs[2], kernel_size=1),
-            nn.Conv2d(256, hid_chs[3], kernel_size=1),
-        ]) # no spatial condition at the bottleneck (512 channels)
+            nn.Conv2d(256, hid_chs[2], kernel_size=1),   # level 2: 56×56, channels=128
+            nn.Conv2d(256, hid_chs[3], kernel_size=1),   # level 3: 28×28, channels=256
+            nn.Conv2d(256, hid_chs[4], kernel_size=1),   # level 4 (bottleneck): 14×14, channels=512
+        ])
 
-    def forward(self, x_t, t, cond_ct, self_cond=None,**kwargs):
-        # x_t [B, C, H, W]
-        # t [B,]
+    def forward(self, x_t, t, cond_ct, self_cond=None, **kwargs):
+        # x_t [B, C, H, W] — noisy X-ray, e.g. [B, 1, 224, 224]
+        # t [B,] — timestep
+        # cond_ct [B, 4, 128, 56, 56] — VAE-encoded CT
 
         # ---- CT conditioning ----
-        ct_feat = self.ct_projector(cond_ct)  # [B, 256, 32, 32]
+        ct_feat = self.ct_projector(cond_ct)  # [B, 256, 56, 56]
 
-        cond_feats = []
-        c = ct_feat
-        for i in range(len(self.cond_down)):
-            cond_feats.append(self.cond_down[i](c))
-            if i < len(self.cond_down) - 1:
-                c = F.avg_pool2d(c, kernel_size=2)
+        # Build conditioning maps at 3 spatial scales via progressive downsampling:
+        #   cond_maps[0]: level 2 → 56×56 (exact match, no pooling)
+        #   cond_maps[1]: level 3 → 28×28 (avg_pool2d ×1)
+        #   cond_maps[2]: bottleneck → 14×14 (avg_pool2d ×2)
+        c = ct_feat                                       # [B, 256, 56, 56]
+        cond_level2 = self.cond_down[0](c)                # [B, 128, 56, 56]
+        c = F.avg_pool2d(c, kernel_size=2)                # [B, 256, 28, 28]
+        cond_level3 = self.cond_down[1](c)                # [B, 256, 28, 28]
+        c = F.avg_pool2d(c, kernel_size=2)                # [B, 256, 14, 14]
+        cond_bottleneck = self.cond_down[2](c)            # [B, 512, 14, 14]
+
+        # Map encoder level index → conditioning (None for levels without CT)
+        # Encoder has 4 blocks: indices 0, 1, 2, 3
+        #   encoder[0]: 224→112 (level 0→1), no CT cond
+        #   encoder[1]: 112→56  (level 1→2), no CT cond
+        #   encoder[2]: 56→28   (level 2→3), CT at level 2 input (56×56)
+        #   encoder[3]: 28→14   (level 3→4), CT at level 3 input (28×28)
+        enc_cond = [None, None, cond_level2, cond_level3]
 
         # -------- In-Convolution --------------
-        x = [None for _ in range(len(self.encoders)+1)]
+        x = [None for _ in range(len(self.encoders) + 1)]
         x_t = torch.cat([x_t, self_cond], dim=1) if self_cond is not None else x_t
-        x[0] = self.inc(x_t)
+        x[0] = self.inc(x_t)  # [B, 32, 224, 224]
 
-        # -------- Time Embedding (Gloabl) -----------
-        time_emb = self.time_embedder(t) # [B, C]
+        # -------- Time Embedding (Global) -----------
+        time_emb = self.time_embedder(t)  # [B, emb_dim]
 
         # --------- Encoder --------------
         for i in range(len(self.encoders)):
-            x[i + 1] = self.encoders[i](x[i], time_emb, cond_map=cond_feats[i])
+            x[i + 1] = self.encoders[i](x[i], time_emb, cond_map=enc_cond[i])
+
+        # Inject CT conditioning at bottleneck (add to deepest encoder output)
+        x[-1] = x[-1] + cond_bottleneck
 
         # -------- Decoder -----------
+        # Decoder mirrors encoder: index i in decoders corresponds to upsampling from level i+1 to level i
+        # Inject CT at decoder levels that correspond to encoder levels with conditioning
+        dec_cond = [None, None, cond_level2, cond_level3]
         for i in range(len(self.decoders), 0, -1):
-            x[i - 1] = self.decoders[i - 1](x[i - 1], x[i], time_emb, cond_map=cond_feats[i - 1])
+            x[i - 1] = self.decoders[i - 1](x[i - 1], x[i], time_emb, cond_map=dec_cond[i - 1])
 
         # ---------Out-Convolution ------------
         y_hor = self.outc(x[0])

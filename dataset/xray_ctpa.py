@@ -79,7 +79,7 @@ class XrayCTPADataset(data.Dataset):
         if not self.VAE:
             ctout = ctout.unsqueeze(0) #(num_slices,H,W) → (1,num_slices,H,W)
         else:
-            ctout = ctout.permute(0,3,1,2) #(4,H/8,W/8,num_slices)-> (4,num_slices,H/8,W/8)
+            ctout = ctout.permute(0,3,1,2) #(4,56,56,128)-> (4,128,56,56)
 
         # Load matching Xray 2D image
         xray = torch.from_numpy(np.load(os.path.join(self.xrays, cxr_accession + '.npy'))).float()
