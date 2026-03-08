@@ -37,7 +37,8 @@ step_start_ema: 100              # Start EMA early (small dataset converges fast
 update_ema_every: 10             # EMA update frequency
 
 # --- Logging & checkpointing ---
-save_and_sample_every: 50       # Save checkpoint and generate samples every N steps
+save_and_sample_every: 50       # Save checkpoint every N steps
+validate_every_n_epochs: 50      # Run full validation (metrics + samples + val loss) every N epochs
 num_sample_rows: 1               # Number of sample rows for visualization
 
 # --- LoRA fine-tuning ---

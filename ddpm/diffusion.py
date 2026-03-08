@@ -1149,6 +1149,7 @@ class Trainer(object):
         step_start_ema,
         update_ema_every,
         save_and_sample_every,
+        validate_every_n_epochs,
         results_folder,
         num_sample_rows,
         max_grad_norm,
@@ -1169,6 +1170,7 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
+        self.validate_every_n_epochs = validate_every_n_epochs
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
@@ -1265,6 +1267,7 @@ class Trainer(object):
                     'step_start_ema': step_start_ema,
                     'update_ema_every': update_ema_every,
                     'save_and_sample_every': save_and_sample_every,
+                    'validate_every_n_epochs': validate_every_n_epochs,
                     'max_grad_norm': max_grad_norm,
                     'image_size': self.image_size,
                     'loss_type': diffusion_model.loss_type,
@@ -1406,31 +1409,45 @@ class Trainer(object):
     @torch.no_grad()
     def validate(self):
         """
-        Run validation on the entire validation dataset.
+        Run full validation on the entire validation dataset:
+        - Compute validation loss (comparable to training loss)
+        - Generate samples and compute metrics (PSNR, SSIM, LPIPS, MAE, MSE)
+        - Save 1 sample comparison figure (real vs generated vs diff)
+        - Save checkpoint
+        - Log everything to wandb
 
         Returns:
-            Dictionary with averaged validation metrics
+            Dictionary with averaged validation metrics including val loss
         """
         self.ema_model.eval()
+        self.model.eval()
 
         all_metrics = {
             'val/psnr': [], 'val/ssim': [], 'val/lpips': [],
             'val/mae': [], 'val/mse': []
         }
+        val_losses = []
+        first_real = None
+        first_generated = None
 
         val_pbar = tqdm(self.val_dl, desc='Validation', unit='batch', leave=False)
-        for val_data in val_pbar:
+        for batch_idx, val_data in enumerate(val_pbar):
             ct_cond = val_data['ct'].cuda()
             real_xray = val_data['cxr'].cuda()
 
-            # Convert real X-ray from [-1, 1] to [0, 1] to match sample() output
-            real_xray = (real_xray + 1.0) / 2.0
+            # --- Compute validation loss (same forward pass as training) ---
+            with autocast('cuda', enabled=self.amp):
+                val_loss = self.model(val_data)
+            val_losses.append(val_loss.item())
 
+            # --- Generate samples and compute metrics ---
+            # Convert real X-ray from [-1, 1] to [0, 1] to match sample() output
+            real_xray_01 = (real_xray + 1.0) / 2.0
             # Generate X-rays from CT condition (output is [0, 1])
             generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=ct_cond.shape[0])
 
-            # Compute metrics (both in [0, 1])
-            metrics = self.compute_metrics(real_xray, generated_xray)
+           # Compute metrics (both in [0,1])
+            metrics = self.compute_metrics(real_xray_01, generated_xray)
 
             all_metrics['val/psnr'].append(metrics['psnr'])
             all_metrics['val/ssim'].append(metrics['ssim'])
@@ -1438,13 +1455,67 @@ class Trainer(object):
             all_metrics['val/mae'].append(metrics['mae'])
             all_metrics['val/mse'].append(metrics['mse'])
 
+            # Save first sample for visualization
+            if batch_idx == 0:
+                first_real = real_xray_01[0:1]          # [1, 1, 224, 224]
+                first_generated = generated_xray[0:1]    # [1, 1, 224, 224]
+
             val_pbar.set_postfix({
+                'val_loss': f'{val_loss.item():.4f}',
                 'psnr': f'{metrics["psnr"]:.2f}',
                 'ssim': f'{metrics["ssim"]:.4f}'
             })
 
-        # Average metrics
+        # --- Average all metrics ---
         avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+        avg_val_loss = np.mean(val_losses)
+        avg_metrics['val/loss'] = avg_val_loss
+
+        tqdm.write(
+            f"[Epoch {self.epoch}] Val Loss: {avg_val_loss:.4f} | "
+            f"Val PSNR: {avg_metrics['val/psnr']:.2f} | "
+            f"Val SSIM: {avg_metrics['val/ssim']:.4f} | "
+            f"Val LPIPS: {avg_metrics['val/lpips']:.4f} | "
+            f"Val MAE: {avg_metrics['val/mae']:.4f}"
+        )
+
+        # --- Create comparison figure for 1 sample ---
+        if first_real is not None and first_generated is not None:
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+            axes[0].imshow(first_real[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[0].set_title('Real X-ray', fontsize=10)
+            axes[0].axis('off')
+
+            axes[1].imshow(first_generated[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[1].set_title('Generated X-ray', fontsize=10)
+            axes[1].axis('off')
+
+            diff = torch.abs(first_real[0, 0] - first_generated[0, 0]).cpu().numpy()
+            axes[2].imshow(diff, cmap='hot')
+            axes[2].set_title('Absolute Difference', fontsize=10)
+            axes[2].axis('off')
+
+            plt.suptitle(
+                f'Epoch {self.epoch} | Val Loss: {avg_val_loss:.4f} | '
+                f'PSNR: {avg_metrics["val/psnr"]:.2f} | SSIM: {avg_metrics["val/ssim"]:.4f}',
+                fontsize=12
+            )
+            plt.tight_layout()
+            sample_path = str(self.results_folder / f'sample-epoch-{self.epoch}.png')
+            plt.savefig(sample_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            if self.use_wandb:
+                avg_metrics['val/comparison'] = wandb.Image(sample_path)
+
+        # --- Save checkpoint ---
+        self.save(f'epoch-{self.epoch}')
+
+        # Note: wandb logging is handled by train() to keep train + val metrics
+        # at the same step for proper chart alignment
+
+        self.model.train()
         return avg_metrics
 
     @torch.no_grad()
@@ -1529,84 +1600,15 @@ class Trainer(object):
 
         return avg_metrics
 
-    @torch.no_grad()
-    def save_and_log_samples(self, milestone):
-        """Save checkpoint and generate samples for visualization."""
-        self.ema_model.eval()
-
-        # Get first batch from validation data for sampling
-        val_data = next(iter(self.val_dl))
-        ct_cond = val_data['ct'].cuda()
-        real_xray = val_data['cxr'].cuda()  # raw [-1, 1]
-
-        num_samples = min(self.num_sample_rows ** 2, ct_cond.shape[0], 4)
-        ct_cond = ct_cond[:num_samples]
-        real_xray = real_xray[:num_samples]
-
-        # Generate samples (output is [0, 1])
-        generated_xray = self.ema_model.sample(cond_ct=ct_cond, batch_size=num_samples)
-
-        # Convert real X-ray from [-1, 1] to [0, 1] for metrics and display
-        real_xray_01 = (real_xray + 1.0) / 2.0
-
-        # Compute metrics (both in [0, 1])
-        metrics = self.compute_metrics(real_xray_01, generated_xray)
-
-        tqdm.write(
-            f"[Milestone {milestone}] PSNR: {metrics['psnr']:.2f} | "
-            f"SSIM: {metrics['ssim']:.4f} | LPIPS: {metrics['lpips']:.4f} | "
-            f"MAE: {metrics['mae']:.4f}"
-        )
-
-        # Create comparison figure
-        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-
-        for i in range(num_samples):
-            # Real X-ray
-            axes[i, 0].imshow(real_xray_01[i, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-            axes[i, 0].set_title('Real X-ray', fontsize=10)
-            axes[i, 0].axis('off')
-
-            # Generated X-ray
-            axes[i, 1].imshow(generated_xray[i, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-            axes[i, 1].set_title('Generated X-ray', fontsize=10)
-            axes[i, 1].axis('off')
-
-            # Difference map
-            diff = torch.abs(real_xray_01[i, 0] - generated_xray[i, 0]).cpu().numpy()
-            axes[i, 2].imshow(diff, cmap='hot')
-            axes[i, 2].set_title('Absolute Difference', fontsize=10)
-            axes[i, 2].axis('off')
-
-        plt.suptitle(f'Step {self.step} | PSNR: {metrics["psnr"]:.2f} | SSIM: {metrics["ssim"]:.4f}', fontsize=12)
-        plt.tight_layout()
-        sample_path = str(self.results_folder / f'sample-{milestone}.png')
-        plt.savefig(sample_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        # Log to wandb
-        if self.use_wandb:
-            wandb.log({
-                'samples/comparison': wandb.Image(sample_path),
-                'samples/psnr': metrics['psnr'],
-                'samples/ssim': metrics['ssim'],
-                'samples/lpips': metrics['lpips'],
-                'samples/mae': metrics['mae'],
-                'samples/mse': metrics['mse'],
-            }, step=self.step)
-
-        # Save checkpoint
-        self.save(milestone)
 
     def train(self):
         """
-        Main training loop — epoch-based with per-epoch logging and validation.
+        Main training loop — epoch-based with per-epoch logging.
 
         - Logs average training loss to wandb every epoch
-        - Runs full validation on entire validation set every epoch
-        - Saves checkpoints and samples at step intervals (save_and_sample_every)
+        - Saves checkpoints at step intervals (save_and_sample_every)
+        - Runs full validation (metrics + samples + val loss + checkpoint) every N epochs
+        - Runs final test evaluation after training completes
         """
         total_epochs = self.train_num_steps // self.steps_per_epoch
         start_epoch = self.step // self.steps_per_epoch
@@ -1620,6 +1622,7 @@ class Trainer(object):
         print(f'Gradient accumulation: {self.gradient_accumulate_every}')
         print(f'Effective batch size: {self.batch_size * self.gradient_accumulate_every}')
         print(f'Results folder: {self.results_folder}')
+        print(f'Validate every: {self.validate_every_n_epochs} epochs')
         print(f'Wandb logging: {self.use_wandb}')
         print(f'{"="*60}\n')
 
@@ -1686,11 +1689,10 @@ class Trainer(object):
                 })
                 pbar.update(1)
 
-                # Save and sample (step-based)
+                # Save checkpoint (step-based)
                 if self.step != 0 and self.step % self.save_and_sample_every == 0:
                     milestone = self.step // self.save_and_sample_every
-                    self.save_and_log_samples(milestone)
-                    self.model.train()
+                    self.save(milestone)
 
                 self.step += 1
 
@@ -1716,16 +1718,9 @@ class Trainer(object):
                 f"Step: {self.step}"
             )
 
-            # Run full validation every epoch
-            if self.val_dl is not None:
+            # Run full validation every N epochs
+            if self.val_dl is not None and (self.epoch + 1) % self.validate_every_n_epochs == 0:
                 val_metrics = self.validate()
-
-                tqdm.write(
-                    f"[Epoch {self.epoch}] Val PSNR: {val_metrics['val/psnr']:.2f} | "
-                    f"Val SSIM: {val_metrics['val/ssim']:.4f} | "
-                    f"Val LPIPS: {val_metrics['val/lpips']:.4f} | "
-                    f"Val MAE: {val_metrics['val/mae']:.4f}"
-                )
                 epoch_log.update(val_metrics)
 
             if self.use_wandb:
