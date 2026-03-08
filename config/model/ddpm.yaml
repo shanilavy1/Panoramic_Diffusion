@@ -3,7 +3,7 @@
 # ============================================================
 # Dataset: ~40 CT-Xray pairs (small dataset)
 # Diffusion: 2D X-ray generation conditioned on VAE-encoded 3D CT
-# CT VAE-encoded shape: (4, 128, 32, 32)
+# CT VAE-encoded shape: (4, 128, 56, 56)
 # X-ray shape: (1, 224, 224)
 # ============================================================
 
@@ -37,7 +37,7 @@ step_start_ema: 100              # Start EMA early (small dataset converges fast
 update_ema_every: 10             # EMA update frequency
 
 # --- Logging & checkpointing ---
-save_and_sample_every: 500       # Save checkpoint and generate samples every N steps
+save_and_sample_every: 50       # Save checkpoint and generate samples every N steps
 num_sample_rows: 1               # Number of sample rows for visualization
 
 # --- LoRA fine-tuning ---
@@ -48,6 +48,9 @@ lora_first: False
 results_folder: "./checkpoints/ddpm/"
 results_folder_postfix: ''
 load_milestone: False
+
+# --- Reproducibility ---
+seed: 42                         # Global random seed for reproducibility
 
 # --- GPU ---
 gpus: 0
@@ -61,4 +64,4 @@ test_ratio: 0.10
 # --- Wandb configuration ---
 use_wandb: True
 wandb_project: Panoramic_Diffusion
-wandb_run_name: null             # Auto-generated if null
+wandb_run_name: experiment_1

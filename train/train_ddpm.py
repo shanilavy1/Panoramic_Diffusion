@@ -4,11 +4,29 @@ from omegaconf import DictConfig, open_dict
 from train.get_dataset import get_dataset
 import torch
 import os
+import random
+import numpy as np
 from ddpm.unet import UNet
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"Random seed set to: {seed}")
 
 
 @hydra.main(config_path='../config', config_name='base_cfg', version_base=None)
 def run(cfg: DictConfig):
+    # Set seed FIRST, before any model/data creation
+    set_seed(cfg.model.seed)
+
     torch.cuda.set_device(cfg.model.gpus)
 
     with open_dict(cfg):
@@ -64,6 +82,7 @@ def run(cfg: DictConfig):
         use_wandb=cfg.model.use_wandb,
         wandb_project=cfg.model.wandb_project,
         wandb_run_name=cfg.model.wandb_run_name,
+        seed=cfg.model.seed,
     )
 
     # Load checkpoint if specified

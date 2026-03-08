@@ -2,6 +2,7 @@
 
 import math
 import copy
+import random
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -1157,8 +1158,10 @@ class Trainer(object):
         use_wandb,
         wandb_project,
         wandb_run_name,
+        seed=42,
     ):
         super().__init__()
+        self.seed = seed
         self.model = diffusion_model
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
@@ -1185,26 +1188,42 @@ class Trainer(object):
                               channels=diffusion_model.channels,
                               num_frames=diffusion_model.num_frames)
 
+        # Seeded DataLoader for reproducibility
+        def seed_worker(worker_id):
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        g_train = torch.Generator()
+        g_train.manual_seed(self.seed)
+
         self.train_dl = DataLoader(self.ds, batch_size=train_batch_size,
                         shuffle=True, pin_memory=True,
-                        num_workers=num_workers, prefetch_factor=2)
+                        num_workers=num_workers, prefetch_factor=2,
+                        worker_init_fn=seed_worker, generator=g_train)
         self.steps_per_epoch = len(self.train_dl)
 
         # Setup validation dataset (non-cycled — iterate fully each epoch)
         self.val_ds = val_dataset
         self.val_dl = None
         if val_dataset:
+            g_val = torch.Generator()
+            g_val.manual_seed(self.seed)
             self.val_dl = DataLoader(self.val_ds, batch_size=train_batch_size,
                         shuffle=False, pin_memory=True,
-                        num_workers=num_workers, prefetch_factor=2)
+                        num_workers=num_workers, prefetch_factor=2,
+                        worker_init_fn=seed_worker, generator=g_val)
 
         # Setup test dataset (non-cycled — iterate fully once)
         self.test_ds = test_dataset
         self.test_dl = None
         if test_dataset:
+            g_test = torch.Generator()
+            g_test.manual_seed(self.seed)
             self.test_dl = DataLoader(self.test_ds, batch_size=train_batch_size,
                         shuffle=False, pin_memory=True,
-                        num_workers=num_workers, prefetch_factor=2)
+                        num_workers=num_workers, prefetch_factor=2,
+                        worker_init_fn=seed_worker, generator=g_test)
 
         print(f'Training dataset size: {len(self.ds)}')
         print(f'Steps per epoch: {self.steps_per_epoch}')
@@ -1258,6 +1277,7 @@ class Trainer(object):
                     'test_dataset_size': len(self.test_ds) if self.test_ds else 0,
                     'steps_per_epoch': self.steps_per_epoch,
                     'lora': lora,
+                    'seed': self.seed,
                 },
                 resume='allow'
             )

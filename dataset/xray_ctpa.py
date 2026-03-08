@@ -1,17 +1,13 @@
 import numpy as np
 import torch
-import random
 import torch.utils.data as data
 import os
 import os.path
 import pandas as pd
 from params import *
 
-torch.manual_seed(0)
-torch.cuda.manual_seed(0)
-np.random.seed(0)
-random.seed(0)
-torch.backends.cudnn.benchmark = False
+# Note: Random seeds are set globally in train_ddpm.py via set_seed()
+# Do not set seeds here to avoid overriding the global seed
 
 class XrayCTPADataset(data.Dataset):
     def __init__(self, root='.', csv_path=None, mode="train", augmentation=False,
@@ -38,10 +34,11 @@ class XrayCTPADataset(data.Dataset):
         assert mode in ["train", "val", "test"], \
             "mode must be one of 'train', 'val', or 'test'"
 
-        # Create reproducible splits
-        np.random.seed(random_seed)
+        # Create reproducible splits using a local RandomState
+        # (avoids overriding the global seed set in train_ddpm.py)
+        rng = np.random.RandomState(random_seed)
         n_samples = len(full_data)
-        indices = np.random.permutation(n_samples)
+        indices = rng.permutation(n_samples)
 
         train_end = int(train_ratio * n_samples)
         val_end = train_end + int(val_ratio * n_samples)
