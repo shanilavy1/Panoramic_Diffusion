@@ -1416,9 +1416,19 @@ class Trainer(object):
         - Save checkpoint
         - Log everything to wandb
 
+        Random states are saved and restored so that validation does not
+        affect the training random sequence (ensures reproducibility
+        regardless of validate_every_n_epochs).
+
         Returns:
             Dictionary with averaged validation metrics including val loss
         """
+        # --- Save random states so validation doesn't affect training ---
+        rng_state_python = random.getstate()
+        rng_state_numpy = np.random.get_state()
+        rng_state_torch = torch.random.get_rng_state()
+        rng_state_cuda = torch.cuda.get_rng_state()
+
         self.ema_model.eval()
         self.model.eval()
 
@@ -1516,6 +1526,13 @@ class Trainer(object):
         # at the same step for proper chart alignment
 
         self.model.train()
+
+        # --- Restore random states so training is unaffected by validation ---
+        random.setstate(rng_state_python)
+        np.random.set_state(rng_state_numpy)
+        torch.random.set_rng_state(rng_state_torch)
+        torch.cuda.set_rng_state(rng_state_cuda)
+
         return avg_metrics
 
     @torch.no_grad()
