@@ -25,7 +25,7 @@ discriminator_weight: 0.0        # Discriminator disabled (set > 0 to enable)
 # --- Training hyperparameters (tuned for ~40 pairs) ---
 batch_size: 4                    # Small batch for small dataset
 train_lr: 1e-4                   # Learning rate
-train_num_steps: 50000           # Total training steps
+train_num_steps: 500000           # Total training steps
 gradient_accumulate_every: 2     # Effective batch = 4 * 2 = 8
 ema_decay: 0.999                 # Higher EMA for small dataset (smoother averaging)
 amp: False                       # Mixed precision off
@@ -37,7 +37,7 @@ step_start_ema: 100              # Start EMA early (small dataset converges fast
 update_ema_every: 10             # EMA update frequency
 
 # --- Logging & checkpointing ---
-save_and_sample_every: 50       # Save checkpoint every N steps
+save_and_sample_every: 350       # Save checkpoint every N steps, 350 steps are 50 epoches for 7 steps per epoch
 validate_every_n_epochs: 50      # Run full validation (metrics + samples + val loss) every N epochs
 num_sample_rows: 1               # Number of sample rows for visualization
 
@@ -46,8 +46,7 @@ lora: False                      # LoRA disabled by default (enable for fine-tun
 lora_first: False
 
 # --- Checkpoint ---
-results_folder: "./checkpoints/ddpm/"
-results_folder_postfix: ''
+results_folder: "./results/ddpm/"
 load_milestone: False
 
 # --- Reproducibility ---
@@ -58,6 +57,7 @@ gpus: 0
 
 # --- Dataset ---
 name_dataset: XRAY_CTPA      # Dataset identifier
+use_augmented_data: False      # Dont use augmented dataset (CT_preprocessed_aug / PX_preprocessed_aug)
 train_ratio: 0.80
 val_ratio: 0.10
 test_ratio: 0.10

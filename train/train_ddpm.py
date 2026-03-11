@@ -30,8 +30,10 @@ def run(cfg: DictConfig):
     torch.cuda.set_device(cfg.model.gpus)
 
     with open_dict(cfg):
+        # Use wandb_run_name as subfolder so each experiment gets isolated results
+        experiment_name = cfg.model.wandb_run_name
         cfg.model.results_folder = os.path.join(
-            cfg.model.results_folder, cfg.dataset.name, cfg.model.results_folder_postfix)
+            cfg.model.results_folder, cfg.dataset.name, experiment_name)
 
     # Create 2D UNet for X-ray diffusion with CT conditioning
     model = UNet(
