@@ -65,4 +65,4 @@ test_ratio: 0.10
 # --- Wandb configuration ---
 use_wandb: True
 wandb_project: Panoramic_Diffusion
-wandb_run_name: experiment_1
+wandb_run_name: experiment_2
