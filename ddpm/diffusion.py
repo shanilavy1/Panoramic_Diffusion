@@ -1148,7 +1148,6 @@ class Trainer(object):
         amp,
         step_start_ema,
         update_ema_every,
-        save_and_sample_every,
         validate_every_n_epochs,
         results_folder,
         num_sample_rows,
@@ -1169,7 +1168,6 @@ class Trainer(object):
         self.update_ema_every = update_ema_every
 
         self.step_start_ema = step_start_ema
-        self.save_and_sample_every = save_and_sample_every
         self.validate_every_n_epochs = validate_every_n_epochs
 
         self.batch_size = train_batch_size
@@ -1247,6 +1245,10 @@ class Trainer(object):
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok=True, parents=True)
 
+        # Best model tracking
+        self.best_ssim = -float('inf')    # Higher is better
+        self.best_lpips = float('inf')    # Lower is better
+
         # Initialize LPIPS metric for validation
         self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='alex').cuda()
         self.lpips_metric.eval()
@@ -1266,7 +1268,6 @@ class Trainer(object):
                     'amp': amp,
                     'step_start_ema': step_start_ema,
                     'update_ema_every': update_ema_every,
-                    'save_and_sample_every': save_and_sample_every,
                     'validate_every_n_epochs': validate_every_n_epochs,
                     'max_grad_norm': max_grad_norm,
                     'image_size': self.image_size,
@@ -1311,6 +1312,47 @@ class Trainer(object):
         save_path = str(self.results_folder / f'model-{milestone}.pt')
         torch.save(data, save_path)
         tqdm.write(f'Saved checkpoint to {save_path}')
+
+    def save_best(self, metric_name, metric_value, first_real=None, first_generated=None, avg_metrics=None):
+        """Save best model checkpoint and comparison image, overwriting the previous best."""
+        data = {
+            'step': self.step,
+            'epoch': self.epoch,
+            'model': self.model.state_dict(),
+            'ema': self.ema_model.state_dict(),
+            'scaler': self.scaler.state_dict(),
+            'optimizer': self.opt.state_dict(),
+            'best_ssim': self.best_ssim,
+            'best_lpips': self.best_lpips,
+        }
+        save_path = str(self.results_folder / f'model-best-{metric_name}.pt')
+        torch.save(data, save_path)
+        tqdm.write(f'New best {metric_name}={metric_value:.4f} at epoch {self.epoch} → {save_path}')
+
+        # Save best comparison image
+        if first_real is not None and first_generated is not None and avg_metrics is not None:
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(first_real[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[0].set_title('Real X-ray', fontsize=10)
+            axes[0].axis('off')
+            axes[1].imshow(first_generated[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[1].set_title('Generated X-ray', fontsize=10)
+            axes[1].axis('off')
+            diff = torch.abs(first_real[0, 0] - first_generated[0, 0]).cpu().numpy()
+            axes[2].imshow(diff, cmap='hot')
+            axes[2].set_title('Absolute Difference', fontsize=10)
+            axes[2].axis('off')
+            plt.suptitle(
+                f'BEST {metric_name.upper()} | Epoch {self.epoch} | '
+                f'SSIM: {avg_metrics["val/ssim"]:.4f} | LPIPS: {avg_metrics["val/lpips"]:.4f} | '
+                f'PSNR: {avg_metrics["val/psnr"]:.2f}',
+                fontsize=12
+            )
+            plt.tight_layout()
+            best_sample_path = str(self.results_folder / f'sample-best-{metric_name}.png')
+            plt.savefig(best_sample_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            tqdm.write(f'Saved best {metric_name} sample → {best_sample_path}')
 
     def load(self, milestone, map_location=None, **kwargs):
         """Load model checkpoint."""
@@ -1522,6 +1564,22 @@ class Trainer(object):
         # --- Save checkpoint ---
         self.save(f'epoch-{self.epoch}')
 
+        # --- Save best model based on SSIM and LPIPS ---
+        current_ssim = avg_metrics['val/ssim']
+        current_lpips = avg_metrics['val/lpips']
+
+        if current_ssim > self.best_ssim:
+            self.best_ssim = current_ssim
+            self.save_best('ssim', current_ssim, first_real, first_generated, avg_metrics)
+            if self.use_wandb:
+                avg_metrics['val/best_ssim'] = current_ssim
+
+        if current_lpips < self.best_lpips:
+            self.best_lpips = current_lpips
+            self.save_best('lpips', current_lpips, first_real, first_generated, avg_metrics)
+            if self.use_wandb:
+                avg_metrics['val/best_lpips'] = current_lpips
+
         # Note: wandb logging is handled by train() to keep train + val metrics
         # at the same step for proper chart alignment
 
@@ -1623,7 +1681,7 @@ class Trainer(object):
         Main training loop — epoch-based with per-epoch logging.
 
         - Logs average training loss to wandb every epoch
-        - Saves checkpoints at step intervals (save_and_sample_every)
+        - Saves best model checkpoints based on SSIM and LPIPS metrics
         - Runs full validation (metrics + samples + val loss + checkpoint) every N epochs
         - Runs final test evaluation after training completes
         """
@@ -1705,11 +1763,6 @@ class Trainer(object):
                     'lr': f'{self.opt.param_groups[0]["lr"]:.2e}'
                 })
                 pbar.update(1)
-
-                # Save checkpoint (step-based)
-                if self.step != 0 and self.step % self.save_and_sample_every == 0:
-                    milestone = self.step // self.save_and_sample_every
-                    self.save(milestone)
 
                 self.step += 1
 

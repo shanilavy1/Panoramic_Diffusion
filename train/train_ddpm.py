@@ -74,7 +74,6 @@ def run(cfg: DictConfig):
         amp=cfg.model.amp,
         step_start_ema=cfg.model.step_start_ema,
         update_ema_every=cfg.model.update_ema_every,
-        save_and_sample_every=cfg.model.save_and_sample_every,
         validate_every_n_epochs=cfg.model.validate_every_n_epochs,
         results_folder=cfg.model.results_folder,
         num_sample_rows=cfg.model.num_sample_rows,
