@@ -26,6 +26,8 @@ from ddpm.text import BERT_MODEL_DIM
 from torch.utils.data import Dataset, DataLoader
 from diffusers import AutoencoderKL
 
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend (thread-safe, no Tkinter)
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
