@@ -25,7 +25,7 @@ discriminator_weight: 0.0        # Discriminator disabled (set > 0 to enable)
 # --- Training hyperparameters (tuned for ~40 pairs) ---
 batch_size: 4                    # Small batch for small dataset
 train_lr: 1e-4                   # Learning rate
-train_num_steps: 500000           # Total training steps
+train_num_steps: 50000           # Total training steps
 gradient_accumulate_every: 2     # Effective batch = 4 * 2 = 8
 ema_decay: 0.999                 # Higher EMA for small dataset (smoother averaging)
 amp: False                       # Mixed precision off
@@ -64,4 +64,4 @@ test_ratio: 0.10
 # --- Wandb configuration ---
 use_wandb: True
 wandb_project: Panoramic_Diffusion
-wandb_run_name: experiment_2
+wandb_run_name: experiment_3
