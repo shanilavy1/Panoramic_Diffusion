@@ -10,7 +10,8 @@ from functools import partial
 
 from torch.utils import data
 from pathlib import Path
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms as T
 from torch.amp import autocast, GradScaler
 from PIL import Image
@@ -1161,6 +1162,8 @@ class Trainer(object):
         wandb_project,
         wandb_run_name,
         seed=42,
+        weight_decay=0.0,
+        use_cosine_lr=False,
     ):
         super().__init__()
         self.seed = seed
@@ -1238,6 +1241,17 @@ class Trainer(object):
 
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.train_lr = train_lr
+
+        # Weight decay: use AdamW when weight_decay > 0
+        self.weight_decay = weight_decay
+        if self.weight_decay > 0:
+            self.opt = AdamW(diffusion_model.parameters(), lr=train_lr, weight_decay=self.weight_decay)
+
+        # Cosine LR schedule: decays LR from train_lr to eta_min over training
+        self.use_cosine_lr = use_cosine_lr
+        self.scheduler = None
+        if self.use_cosine_lr:
+            self.scheduler = CosineAnnealingLR(self.opt, T_max=train_num_steps, eta_min=1e-6)
         self.step = 0
         self.epoch = 0
         self.amp = amp
@@ -1284,6 +1298,8 @@ class Trainer(object):
                     'steps_per_epoch': self.steps_per_epoch,
                     'lora': lora,
                     'seed': self.seed,
+                    'weight_decay': self.weight_decay,
+                    'use_cosine_lr': self.use_cosine_lr,
                 },
                 resume='allow'
             )
@@ -1753,6 +1769,10 @@ class Trainer(object):
                 self.scaler.step(self.opt)
                 self.scaler.update()
                 self.opt.zero_grad()
+
+                # LR scheduler step
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 # EMA update
                 if self.step % self.update_ema_every == 0:

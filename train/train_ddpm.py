@@ -85,6 +85,8 @@ def run(cfg: DictConfig):
         wandb_project=cfg.model.wandb_project,
         wandb_run_name=cfg.model.wandb_run_name,
         seed=cfg.model.seed,
+        weight_decay=cfg.model.get('weight_decay', 0.0),
+        use_cosine_lr=cfg.model.get('use_cosine_lr', False),
     )
 
     # Load checkpoint if specified

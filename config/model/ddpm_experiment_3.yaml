@@ -24,13 +24,17 @@ discriminator_weight: 0.0        # Discriminator disabled (set > 0 to enable)
 
 # --- Training hyperparameters (tuned for ~40 pairs) ---
 batch_size: 4                    # Small batch for small dataset
-train_lr: 1e-4                   # Learning rate
+train_lr: 5e-5                   # Lower LR to reduce overfitting (was 1e-4)
 train_num_steps: 50000           # Total training steps
 gradient_accumulate_every: 2     # Effective batch = 4 * 2 = 8
 ema_decay: 0.999                 # Higher EMA for small dataset (smoother averaging)
 amp: False                       # Mixed precision off
 max_grad_norm: 1.0               # Gradient clipping
 num_workers: 4                   # DataLoader workers
+
+# --- Regularization ---
+weight_decay: 1e-4               # L2 regularization via AdamW
+use_cosine_lr: True              # Cosine annealing LR schedule (decays to 1e-6)
 
 # --- EMA settings ---
 step_start_ema: 100              # Start EMA early (small dataset converges faster)
