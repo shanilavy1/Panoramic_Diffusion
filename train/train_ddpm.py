@@ -7,6 +7,7 @@ import os
 import random
 import numpy as np
 from ddpm.unet import UNet
+from ddpm.unet_v2 import UNetV2
 
 
 def set_seed(seed):
@@ -36,11 +37,21 @@ def run(cfg: DictConfig):
             cfg.model.results_folder, cfg.dataset.name, experiment_name)
 
     # Create 2D UNet for X-ray diffusion with CT conditioning
-    model = UNet(
-        in_ch=cfg.model.diffusion_num_channels,   # 1 for grayscale X-ray
-        out_ch=cfg.model.diffusion_num_channels,   # 1 for noise prediction
-        spatial_dims=2,                             # 2D UNet for X-ray
-    ).cuda()
+    unet_type = cfg.model.get('unet_type', 'v1')
+    if unet_type == 'v2':
+        model = UNetV2(
+            in_ch=cfg.model.diffusion_num_channels,   # 1 for grayscale X-ray
+            out_ch=cfg.model.diffusion_num_channels,   # 1 for noise prediction
+            spatial_dims=2,                             # 2D UNet for X-ray
+        ).cuda()
+        print(f'Using UNetV2 (ResNet blocks + attention + FiLM CT conditioning)')
+    else:
+        model = UNet(
+            in_ch=cfg.model.diffusion_num_channels,   # 1 for grayscale X-ray
+            out_ch=cfg.model.diffusion_num_channels,   # 1 for noise prediction
+            spatial_dims=2,                             # 2D UNet for X-ray
+        ).cuda()
+        print(f'Using UNet v1 (MONAI blocks + additive CT conditioning)')
 
     # Create diffusion model for 2D X-ray generation conditioned on CT
     diffusion = GaussianDiffusion(

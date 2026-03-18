@@ -1,3 +1,3 @@
 defaults:
   - dataset: xrayctpa
-  - model: ddpm_experiment_2 # experiment configuration
+  - model: ddpm_experiment_4 # experiment configuration
